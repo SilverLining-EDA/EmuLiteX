@@ -184,6 +184,7 @@ class SoCBusHandler(LiteXModule):
     supported_address_width = [32, 64]
     supported_addressing    = ["word", "byte"]
     supported_interconnect  = ["shared", "crossbar"]
+    supported_arbiter       = ["default", "transaction"]
 
     # Creation -------------------------------------------------------------------------------------
     def __init__(self, name="SoCBusHandler",
@@ -194,6 +195,8 @@ class SoCBusHandler(LiteXModule):
         timeout          = int(1e6),
         bursting         = False,
         interconnect     = "shared", interconnect_register=True,
+        arbiter          = "default",
+        low_latency      = False,
         reserved_regions = None,
     ):
         self.logger = logging.getLogger(name)
@@ -253,6 +256,17 @@ class SoCBusHandler(LiteXModule):
             raise SoCError()
         if timeout is not None:
             timeout = int(timeout)
+        if arbiter not in self.supported_arbiter:
+            self.logger.error("Unsupported {} {}, supported are: {:s}".format(
+                colorer("Bus Arbiter", color="red"),
+                colorer(arbiter),
+                colorer(", ".join(self.supported_arbiter))))
+            raise SoCError()
+        if standard != "wishbone" and arbiter != "default":
+            self.logger.error("{} can only be used with {} Bus.".format(
+                colorer("Bus Arbiter", color="red"),
+                colorer("Wishbone")))
+            raise SoCError()
 
         # Create Bus
         self.standard              = standard
@@ -262,6 +276,8 @@ class SoCBusHandler(LiteXModule):
         self.bursting              = bursting
         self.interconnect          = interconnect
         self.interconnect_register = interconnect_register
+        self.arbiter               = arbiter
+        self.low_latency           = low_latency
         self.masters               = {}
         self.slaves                = {}
         self.regions               = {}
@@ -647,7 +663,10 @@ class SoCBusHandler(LiteXModule):
                         colorer(type(master).__name__),
                         colorer(type(slave).__name__)))
                     raise SoCError()
-                bridge = bridge_cls(master, slave)
+                bridge_kwargs = {}
+                if getattr(bridge_cls, "supports_low_latency", False):
+                    bridge_kwargs["low_latency"] = self.low_latency
+                bridge = bridge_cls(master, slave, **bridge_kwargs)
                 self.submodules += bridge
                 return adapted_interface
 
@@ -676,7 +695,7 @@ class SoCBusHandler(LiteXModule):
         return adapted_interface
 
     # Add Remapper ---------------------------------------------------------------------------------
-    def add_remapper(self, name, interface, origin, size):
+    def add_remapper(self, name, interface, origin, size, src_regions=None, dst_regions=None):
         interface_cls = type(interface)
         remapper_cls  = {
             wishbone.Interface   : wishbone.Remapper,
@@ -686,7 +705,12 @@ class SoCBusHandler(LiteXModule):
 
         adapted_interface = interface_cls(**self._get_interface_args(interface))
 
-        self.submodules += remapper_cls(interface, adapted_interface, origin, size)
+        self.submodules += remapper_cls(interface, adapted_interface,
+            origin      = origin,
+            size        = size,
+            src_regions = src_regions,
+            dst_regions = dst_regions,
+        )
 
         fmt = "{name} Bus {remapped} to {origin} (Size: {size})."
         self.logger.info(fmt.format(
@@ -694,6 +718,34 @@ class SoCBusHandler(LiteXModule):
             remapped = colorer("remapped", color="cyan"),
             origin   = colorer(f"0x{origin:08x}"),
             size     = colorer(f"0x{size:08x}"),
+        ))
+
+        return adapted_interface
+
+    # Add Slave Remapper ---------------------------------------------------------------------------
+    def add_slave_remapper(self, name, interface, region, dst_region):
+        interface_cls = type(interface)
+        remapper_cls  = {
+            wishbone.Interface   : wishbone.Remapper,
+            axi.AXILiteInterface : axi.AXILiteRemapper,
+            axi.AXIInterface     : axi.AXIRemapper,
+        }[interface_cls]
+
+        adapted_interface = interface_cls(**self._get_interface_args(interface,
+            address_width = self.address_width))
+
+        self.submodules += remapper_cls(adapted_interface, interface,
+            src_regions = [region],
+            dst_regions = [dst_region],
+        )
+
+        fmt = "{name} Bus {remapped} from {origin} to {dst_origin} (Size: {size})."
+        self.logger.info(fmt.format(
+            name       = colorer(name),
+            remapped   = colorer("remapped", color="cyan"),
+            origin     = colorer(f"0x{region.origin:08x}"),
+            dst_origin = colorer(f"0x{dst_region.origin:08x}"),
+            size       = colorer(f"0x{region.size:08x}"),
         ))
 
         return adapted_interface
@@ -784,7 +836,7 @@ class SoCBusHandler(LiteXModule):
     def add_controller(self, name=None, controller=None):
         self.add_master(name=name, master=controller)
 
-    def add_slave(self, name=None, slave=None, region=None, strip_origin=False, clock_domain=None):
+    def add_slave(self, name=None, slave=None, region=None, strip_origin=False, clock_domain=None, dst_region=None):
         no_name   = name   is None
         no_region = region is None
         region_added = False
@@ -813,6 +865,7 @@ class SoCBusHandler(LiteXModule):
                     colorer("SoCRegion")))
                 raise SoCError()
             self.add_region(name, region)
+            region = self.regions[name]
             region_added = True
         # Check decoded Region origin alignment early, with the Slave's name (the decoder would
         # only raise at finalize, without naming the offending Region).
@@ -823,9 +876,42 @@ class SoCBusHandler(LiteXModule):
             if region_added:
                 self.regions.pop(name, None)
             raise SoCError()
+        if dst_region is not None:
+            if strip_origin:
+                self.logger.error("{} Bus Slave cannot use both {} and {}.".format(
+                    colorer(name, color="red"),
+                    colorer("strip_origin"),
+                    colorer("dst_region")))
+                if region_added:
+                    self.regions.pop(name, None)
+                raise SoCError()
+            if not isinstance(dst_region, SoCRegion) or isinstance(dst_region, SoCIORegion):
+                self.logger.error("{} Bus Slave Destination Region must be a {}.".format(
+                    colorer(name, color="red"),
+                    colorer("SoCRegion")))
+                if region_added:
+                    self.regions.pop(name, None)
+                raise SoCError()
+            if dst_region.origin is None:
+                self.logger.error("{} Bus Slave Destination Region origin must be specified:".format(
+                    colorer(name, color="red")))
+                self.logger.error(str(dst_region))
+                if region_added:
+                    self.regions.pop(name, None)
+                raise SoCError()
+            if dst_region.size < region.size:
+                self.logger.error("{} Bus Slave Destination Region is smaller than source Region:".format(
+                    colorer(name, color="red")))
+                self.logger.error("Source:      " + str(region))
+                self.logger.error("Destination: " + str(dst_region))
+                if region_added:
+                    self.regions.pop(name, None)
+                raise SoCError()
         try:
             if strip_origin:
                 slave = self.add_offset(name, slave, self.regions[name].origin)
+            if dst_region is not None:
+                slave = self.add_slave_remapper(name, slave, region, dst_region)
             slave = self.add_clock_domain_crossing(name, slave, clock_domain)
             slave = self.add_adapter(name, slave, "s2m")
             self.slaves[name] = slave
@@ -902,12 +988,18 @@ class SoCBusHandler(LiteXModule):
                     "shared"  : interconnect_shared_cls,
                     "crossbar": interconnect_crossbar_cls,
                 }[self.interconnect]
-                self._interconnect = interconnect_cls(
+                interconnect_kwargs = dict(
                     masters        = list(self.masters.values()),
                     slaves         = [(self.regions[n].decoder(self), s) for n, s in self.slaves.items()],
                     register       = self.interconnect_register,
-                    timeout_cycles = self.timeout
+                    timeout_cycles = self.timeout,
                 )
+                if self.standard == "wishbone":
+                    interconnect_kwargs["arbiter"] = {
+                        "default"     : "cycle",
+                        "transaction" : "transaction",
+                    }[self.arbiter]
+                self._interconnect = interconnect_cls(**interconnect_kwargs)
             self.logger.info("Interconnect: {} ({} <-> {}).".format(
                 colorer(self._interconnect.__class__.__name__),
                 colorer(len(self.masters)),
@@ -1260,6 +1352,8 @@ class SoC(LiteXModule):
         bus_timeout          = int(1e6),
         bus_bursting         = False,
         bus_interconnect     = "shared",
+        bus_arbiter          = "default",
+        bus_low_latency      = False,
         bus_reserved_regions = None,
 
         csr_data_width       = 32,
@@ -1310,6 +1404,8 @@ class SoC(LiteXModule):
             timeout          = bus_timeout,
             bursting         = bus_bursting,
             interconnect     = bus_interconnect,
+            arbiter          = bus_arbiter,
+            low_latency      = bus_low_latency,
             reserved_regions = bus_reserved_regions,
            )
 
@@ -2381,7 +2477,7 @@ class LiteXSoC(SoC):
             )
 
     # Add Ethernet ---------------------------------------------------------------------------------
-    def add_ethernet(self, name="ethmac", phy=None, phy_cd=None, dynamic_ip=False, software_debug=False,
+    def add_ethernet(self, name="ethmac", phy=None, phy_cd=None, dynamic_ip=False, with_dhcp=False, software_debug=False,
         data_width              = 8,
         nrxslots                = 2, rxslots_read_only  = True,
         ntxslots                = 2, txslots_write_only = False,
@@ -2473,13 +2569,20 @@ class LiteXSoC(SoC):
         if self.irq.enabled:
             self.irq.add(name, use_loc_if_exists=True)
 
-        # Dynamic IP (if enabled).
+        # Dynamic IP/DHCP (if enabled).
+        if with_dhcp:
+            dynamic_ip = True
+
         if dynamic_ip:
             if local_ip is not None:
                 self.logger.error("Ethernet {} cannot be used with {}.".format(
                     colorer("local_ip"), colorer("dynamic_ip", color="red")))
                 raise SoCError()
             self.add_constant("ETH_DYNAMIC_IP")
+
+        if with_dhcp:
+            self.add_constant("ETH_UDP_BROADCAST")
+            self.add_constant("ETH_WITH_DHCP")
 
         # Local/Remote IP Configuration (optional).
         if local_ip:
@@ -3434,6 +3537,8 @@ class SoCCore(LiteXSoC):
         bus_timeout                = int(1e6),
         bus_bursting               = False,
         bus_interconnect           = "shared",
+        bus_arbiter                = "default",
+        bus_low_latency            = False,
 
         # CPU parameters.
         cpu_type                   = "vexriscv",
@@ -3514,6 +3619,8 @@ class SoCCore(LiteXSoC):
             bus_timeout          = bus_timeout,
             bus_bursting         = bus_bursting,
             bus_interconnect     = bus_interconnect,
+            bus_arbiter          = bus_arbiter,
+            bus_low_latency      = bus_low_latency,
             bus_reserved_regions = {},
 
             csr_data_width       = csr_data_width,
@@ -3708,6 +3815,8 @@ def soc_core_args(parser, cpu_type="vexriscv", cpu_variant=None):
     soc_group.add_argument("--bus-timeout",       default=int(1e6),    type=auto_int,                                                help="Bus timeout in cycles.")
     soc_group.add_argument("--bus-bursting",      action="store_true",                                                               help="Enable burst cycles on the bus if supported.")
     soc_group.add_argument("--bus-interconnect",  default="shared",                   choices=SoCBusHandler.supported_interconnect,  help="Select bus interconnect.")
+    soc_group.add_argument("--bus-arbiter",       default="default",                  choices=SoCBusHandler.supported_arbiter,        help="Select bus arbiter.")
+    soc_group.add_argument("--bus-low-latency",  action="store_true",                                                               help="Enable low-latency bus bridges when available.")
 
     # CPU parameters.
     soc_group.add_argument("--cpu-type",                 default="vexriscv",                 help="Select CPU: {}.".format(", ".join(map(str, cpu.CPUS.keys()))))

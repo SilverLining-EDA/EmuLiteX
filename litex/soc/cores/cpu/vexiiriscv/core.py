@@ -51,17 +51,18 @@ class VexiiRiscv(CPU):
     with_supervisor  = False
     with_opensbi     = False
     vexii_args       = ""
-    isa_map            = {'i', 'zicbom', 'zicsr', 'zifencei'}
+    isa_map            = None
     internal_mem_map   = dict()
     # vexii params received from vexii:
     xlen               = None
     internal_bus_width = None
-    with_rvc           = None
-    with_rvm           = None
-    with_rvf           = None
-    with_rvd           = None
-    with_rva           = None
-    with_rvcbom        = None
+    pbus_address_width = 32
+    pbus_data_width    = 32
+    mbus_address_width = 32
+    mbus_id_width      = 8
+    dma_address_width  = 32
+    dma_data_width     = None
+    dma_id_width       = 4
 
     # ABI.
     @staticmethod
@@ -86,17 +87,27 @@ class VexiiRiscv(CPU):
             if isa in VexiiRiscv.isa_map:
                 arch += isa
 
-        arch += "_" + "_".join(filter(lambda v: len(v) > 1 and not v in ignores, VexiiRiscv.isa_map))
+        extensions = list(filter(lambda v: len(v) > 1 and not v in ignores, VexiiRiscv.isa_map))
+        if "m" in VexiiRiscv.isa_map and "zmmul" in extensions:
+            extensions.remove("zmmul")
+        if extensions:
+            arch += "_" + "_".join(extensions)
 
         return arch
 
     # Arch for GCC march.
     def get_gcc_arch():
-        # Workaround: add exception for extensions that are not supported
-        # by the GCC in default build.
-        ex = ["zicbom", "zicntr", "zicsr", "zifencei", "zihpm", "sscofpmf"]
+        # Keep BIOS/toolchain flags conservative. Vexii can expose privileged
+        # or recent extensions that the default GCC might not support.
+        arch = f"rv{VexiiRiscv.xlen}i2p0"
+        isas = ""
+        for isa in "mafdc":
+            if isa in VexiiRiscv.isa_map:
+                isas += isa
 
-        return VexiiRiscv.get_arch(ex)
+        if isas:
+            arch += "_" + isas
+        return arch
 
     # Memory Mapping.
     @property
@@ -127,7 +138,7 @@ class VexiiRiscv(CPU):
     def gcc_flags(self):
         flags =  f" -march={VexiiRiscv.get_gcc_arch()} -mabi={VexiiRiscv.get_abi()}"
         flags += f" -D__VexiiRiscv__"
-        if VexiiRiscv.with_rvcbom:
+        if "zicbom" in VexiiRiscv.isa_map:
             flags += f" -D__riscv_zicbom__"
         if VexiiRiscv.soc_args.with_aplic:
             flags += f" -D__riscv_aplic__"
@@ -145,17 +156,23 @@ class VexiiRiscv(CPU):
     def args_fill(parser):
         cpu_group = parser.add_argument_group(title="CPU options")
         VexiiRiscv.soc_keys = []
+        VexiiRiscv.soc_arg_names = {}
 
         def add_soc_arg(*names, **kwargs):
             # SoCGen forwarding policy:
             # - add_soc_arg() registers options that will be forwarded to SocGen and will affect the netlist md5
             # - Forwarded flag names are derived from argparse 'dest' (underscores -> dashes)
-            #   Use 'dest=' to map a user-facing CLI option to a different SocGen flag name
+            #   Use 'socgen_name=' to map a user-facing CLI option to a different SocGen flag name
+            #   Use 'forward=False' to keep a LiteX-side option in soc_args without forwarding it
             # - store_true options are forwarded only if enabled
             # - scalar options (int/str) are forwarded unconditionally as --flag=value
             # - append options are forwarded once per entry: --flag <entry>
+            forward     = kwargs.pop("forward", True)
+            socgen_name = kwargs.pop("socgen_name", None)
             action = cpu_group.add_argument(*names, **kwargs)
             VexiiRiscv.soc_keys.append(action.dest)
+            if forward:
+                VexiiRiscv.soc_arg_names[action.dest] = socgen_name or action.dest.replace("_", "-")
             return action
 
         cpu_group.add_argument("--update-repo",      default="recommended", choices=["latest","wipe+latest","recommended","wipe+recommended","no"], help="Specify how the VexiiRiscv & SpinalHDL repo should be updated (latest: update to HEAD, recommended: Update to known compatible version, no: Don't update, wipe+*: Do clean&reset before checkout)")
@@ -169,6 +186,7 @@ class VexiiRiscv(CPU):
         add_soc_arg("--cpu-count", default=1, type=int,                          help="How many VexiiRiscv CPU.")
         add_soc_arg("--with-cpu-clk",                       action="store_true", help="The CPUs will use a decoupled clock")
         add_soc_arg("--with-axi3",                          action="store_true", help="mbus will be axi3 instead of axi4")
+        add_soc_arg("--with-axilite-xlen",                  action="store_true", help="Use CPU XLEN as pBus AXI-Lite data width.")
         add_soc_arg("--with-coherent-dma", dest="with_dma", action="store_true", help="Enable coherent DMA accesses.")
         # Vexii: debug
         add_soc_arg("--with-jtag-tap",         action="store_true", help="Add a embedded JTAG tap for debugging.")
@@ -179,7 +197,7 @@ class VexiiRiscv(CPU):
         add_soc_arg("--l2-self-flush", default=None,        help="VexiiRiscv L2 ways will self flush on from,to,cycles")
         # Vexii: interrupts
         add_soc_arg("--with-aplic",                  action="store_true",   help="Enable APLIC.")
-        add_soc_arg("--imsic-interrupts", dest="imsic_interrupt_number", default=0, type=int, help="VexiiRiscv IMSIC interrupts, 0 disables this feature.")
+        add_soc_arg("--imsic-interrupts", dest="imsic_interrupt_number", socgen_name="imsic-interrupt-number", default=0, type=int, help="VexiiRiscv IMSIC interrupts, 0 disables this feature.")
         # Vexii: peripherals
         add_soc_arg("--vexii-video", dest="video",  action="append", default=[], help="Add the memory coherent video controller")
         add_soc_arg("--vexii-macsg", dest="mac_sg", action="append", default=[], help="Add the memory coherent ethernet mac")
@@ -189,64 +207,116 @@ class VexiiRiscv(CPU):
                                 help="Set the io region mapping for peripheral device", metavar=("ADDRESS", "LENGTH")),
 
     @staticmethod
+    def _reset_args():
+        VexiiRiscv.with_supervisor    = False
+        VexiiRiscv.with_opensbi       = False
+        VexiiRiscv.vexii_args         = ""
+        VexiiRiscv.isa_map            = None
+        VexiiRiscv.pbus_address_width = 32
+        VexiiRiscv.pbus_data_width    = 32
+        VexiiRiscv.mbus_address_width = 32
+        VexiiRiscv.mbus_id_width      = 8
+        VexiiRiscv.dma_address_width  = 32
+        VexiiRiscv.dma_data_width     = None
+        VexiiRiscv.dma_id_width       = 4
+
+    @staticmethod
+    def _get_soc_args():
+        soc_args = []
+        for k, v in vars(VexiiRiscv.soc_args).items():
+            name = VexiiRiscv.soc_arg_names.get(k)
+            if name is None:
+                continue
+            if isinstance(v, bool):
+                if v:
+                    soc_args.append(f"--{name}")
+            elif isinstance(v, (int, str)):
+                soc_args.append(f"--{name}={v}")
+            elif isinstance(v, list):
+                for arg_value in v:
+                    soc_args.append(f"--{name} {arg_value}")
+            elif v is None:
+                pass
+            else:
+                raise Exception(f"unimplemented: {type(v)}")
+        return soc_args
+
+    @staticmethod
+    def _build_vexii_args(args, isa_map, with_user_isa=True):
+        isa_map = set() if isa_map is None else set(isa_map)
+        vexii_args = ""
+
+        if with_user_isa:
+            isa_map.update(args.isa)
+        isa_map.update(["m", "zihpm", "zicntr"])
+        vexii_args += " --with-mul --with-div --allow-bypass-from=0"
+        vexii_args += " --fetch-l1 --fetch-l1-ways=2"
+        vexii_args += " --lsu-l1 --lsu-l1-ways=2  --with-lsu-bypass"
+        vexii_args += " --relaxed-branch"
+
+        if args.cpu_variant in ["linux", "debian"]:
+            VexiiRiscv.with_opensbi = True
+            VexiiRiscv.with_supervisor = True
+            isa_map.update(["a", "s", "u"])
+            vexii_args += " --fetch-l1-ways=4 --fetch-l1-mem-data-width-min=64"
+            vexii_args += " --lsu-l1-ways=4 --lsu-l1-mem-data-width-min=64"
+
+        if args.cpu_variant in ["debian"]:
+            isa_map.update(["c", "f", "d"])
+            vexii_args += " --xlen=64 --fma-reduced-accuracy --fpu-ignore-subnormal"
+
+        if args.cpu_variant in ["linux", "debian"]:
+            vexii_args += " --with-btb --with-ras --with-gshare"
+
+        if args.with_aia or args.imsic_interrupt_number > 0:
+            isa_map.add("smaia")
+            if "s" in isa_map:
+                isa_map.add("ssaia")
+
+        vexii_args += " --with-isa=" + ",".join(isa_map)
+        VexiiRiscv.isa_map = isa_map
+        return vexii_args
+
+    @staticmethod
     def args_read(args):
         print(args)
 
         vdir = get_data_mod("cpu", "vexiiriscv").data_location
         ndir = os.path.join(vdir, "ext", "VexiiRiscv")
 
-        NaxRiscv.git_setup("VexiiRiscv", ndir, "https://github.com/SpinalHDL/VexiiRiscv.git", "dev", "a882924f731d8ad1b5eaff6f098f3b8ac3dbfe43", args.update_repo)
+        NaxRiscv.git_setup("VexiiRiscv", ndir, "https://github.com/SpinalHDL/VexiiRiscv.git", "dev", "235753e24f2d960e49a0852205bae1400bf22c19", args.update_repo)
 
         if not args.cpu_variant:
             args.cpu_variant = "standard"
+
+        VexiiRiscv._reset_args()
 
         if not args.io_map is None:
             VexiiRiscv.io_regions = {int(args.io_map[0], 0): int(args.io_map[1], 0)}
         VexiiRiscv.internal_mem_map.update({devinfo[0]: int(devinfo[1], 0) for devinfo in args.mem_map})
 
-        VexiiRiscv.isa_map.update(args.isa)
-        VexiiRiscv.isa_map.update(["m", "zihpm", "zicntr"])
-        VexiiRiscv.vexii_args += " --with-mul --with-div --allow-bypass-from=0"
-        VexiiRiscv.vexii_args += " --fetch-l1 --fetch-l1-ways=2"
-        VexiiRiscv.vexii_args += " --lsu-l1 --lsu-l1-ways=2  --with-lsu-bypass"
-        VexiiRiscv.vexii_args += " --relaxed-branch"
-
-        if args.cpu_variant in ["linux", "debian"]:
-            VexiiRiscv.with_opensbi = True
-            VexiiRiscv.with_supervisor = True
-            VexiiRiscv.isa_map.update(["a", "s", "u"])
-            VexiiRiscv.vexii_args += " --fetch-l1-ways=4 --fetch-l1-mem-data-width-min=64"
-            VexiiRiscv.vexii_args += " --lsu-l1-ways=4 --lsu-l1-mem-data-width-min=64"
-
-        if args.cpu_variant in ["debian"]:
-            VexiiRiscv.isa_map.update(["c", "f", "d"])
-            VexiiRiscv.vexii_args += " --xlen=64 --fma-reduced-accuracy --fpu-ignore-subnormal"
-
-        if args.cpu_variant in ["linux", "debian"]:
-            VexiiRiscv.vexii_args += " --with-btb --with-ras --with-gshare"
-
-        if args.with_aia or args.imsic_interrupt_number > 0:
-            VexiiRiscv.isa_map.add("smaia")
-            if "s" in VexiiRiscv.isa_map:
-                VexiiRiscv.isa_map.add("ssaia")
-
-        VexiiRiscv.vexii_args += " --with-isa=" + ",".join(VexiiRiscv.isa_map)
-
         VexiiRiscv.soc_args = SimpleNamespace(**{k:getattr(args,k) for k in VexiiRiscv.soc_keys})
         VexiiRiscv.no_netlist_cache = args.no_netlist_cache
-        VexiiRiscv.vexii_args      += " " + args.vexii_args
         VexiiRiscv.update_repo      = args.update_repo
+        VexiiRiscv.vexii_args       = VexiiRiscv._build_vexii_args(args, VexiiRiscv.isa_map)
+        VexiiRiscv.vexii_args      += " " + args.vexii_args
+        metadata_args               = " ".join([VexiiRiscv.vexii_args] + VexiiRiscv._get_soc_args())
 
         md5_hash = hashlib.md5()
-        md5_hash.update(VexiiRiscv.vexii_args.encode('utf-8'))
+        md5_hash.update(b"interface-metadata-v1")
+        md5_hash.update(metadata_args.encode("utf-8"))
         vexii_args_hash = md5_hash.hexdigest()
         ppath = os.path.join(vdir, str(vexii_args_hash) + ".py")
         if VexiiRiscv.no_netlist_cache or not os.path.exists(ppath):
-            cmd = f"""cd {ndir} && sbt "runMain vexiiriscv.soc.litex.PythonArgsGen {VexiiRiscv.vexii_args} --python-file={str(ppath)}\""""
+            cmd = f"""cd {ndir} && sbt "runMain vexiiriscv.soc.litex.PythonArgsGen {metadata_args} --python-file={str(ppath)}\""""
             subprocess.check_call(cmd, shell=True)
-        # Loads variables like VexiiRiscv.with_rvm, that set the RISC-V extensions.
+        # Loads variables like VexiiRiscv.isa_map, that set the RISC-V extensions.
         with open(ppath) as file:
             exec(file.read())
+
+        # rebuild arguments
+        VexiiRiscv.vexii_args  = VexiiRiscv._build_vexii_args(args, VexiiRiscv.isa_map, with_user_isa=False)
+        VexiiRiscv.vexii_args += " " + args.vexii_args
 
         VexiiRiscv.gcc_triple = CPU_GCC_TRIPLE_RISCV32 if VexiiRiscv.xlen==32 else CPU_GCC_TRIPLE_RISCV64
         VexiiRiscv.linker_output_format = f"elf{VexiiRiscv.xlen}-littleriscv"
@@ -256,7 +326,10 @@ class VexiiRiscv(CPU):
         self.platform         = platform
         self.reset            = Signal()
         self.interrupt        = Signal(32)
-        self.pbus             = pbus = axi.AXILiteInterface(address_width=32, data_width=32)
+        self.pbus             = pbus = axi.AXILiteInterface(
+            address_width = VexiiRiscv.pbus_address_width,
+            data_width    = VexiiRiscv.pbus_data_width,
+        )
 
         self.periph_buses     = [pbus] # Peripheral buses (Connected to main SoC's bus).
         self.memory_buses     = []           # Memory buses (Connected directly to LiteDRAM).
@@ -310,7 +383,12 @@ class VexiiRiscv(CPU):
             )
 
         if VexiiRiscv.soc_args.with_dma:
-            self.dma_bus = dma_bus = axi.AXIInterface(data_width=VexiiRiscv.internal_bus_width, address_width=32, id_width=4)
+            dma_data_width = VexiiRiscv.dma_data_width or VexiiRiscv.internal_bus_width
+            self.dma_bus = dma_bus = axi.AXIInterface(
+                data_width    = dma_data_width,
+                address_width = VexiiRiscv.dma_address_width,
+                id_width      = VexiiRiscv.dma_id_width,
+            )
 
             self.cpu_params.update(
                 # DMA Bus.
@@ -445,19 +523,7 @@ class VexiiRiscv(CPU):
             gen_args.append(f"--memory-region={region[0]},{region[1]},{region[2]},{region[3]}")
         for device, address in VexiiRiscv.internal_mem_map.items():
             gen_args.append(" --device-region:{}={}".format(device, address))
-        for k,v in vars(VexiiRiscv.soc_args).items():
-            if isinstance(v, bool):
-                if v:
-                    gen_args.append(f"--{k.replace('_','-')}")
-            elif isinstance(v, int) or isinstance(v, str):
-                gen_args.append(f"--{k.replace('_', '-')}={v}")
-            elif isinstance(v, list):
-                for arg_value in v:
-                    gen_args.append(f"--{k.replace('_', '-')} {arg_value}")
-            elif v == None:
-                pass
-            else:
-                raise Exception(f"unimplemented: {type(v)}")
+        gen_args += VexiiRiscv._get_soc_args()
 
         cmd = f"""cd {ndir} && sbt "runMain vexiiriscv.soc.litex.SocGen {" ".join(gen_args)}\""""
         print("VexiiRiscv generation command :")
@@ -566,8 +632,8 @@ class VexiiRiscv(CPU):
 
         mbus = axi.AXIInterface(
             data_width    = VexiiRiscv.litedram_width,
-            address_width = 32,
-            id_width      = 8,
+            address_width = VexiiRiscv.mbus_address_width,
+            id_width      = VexiiRiscv.mbus_id_width,
             version       = "axi3" if VexiiRiscv.soc_args.with_axi3 else "axi4"
         )
         self.mBus_awallStrb = Signal()

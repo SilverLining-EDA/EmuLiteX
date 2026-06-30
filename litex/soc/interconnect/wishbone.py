@@ -228,6 +228,8 @@ class ClockDomainCrossing(LiteXModule):
         assert len(master.dat_w) == len(slave.dat_w)
         assert len(master.dat_r) == len(slave.dat_r)
         assert len(master.sel)   == len(slave.sel)
+        assert len(master.cti)   == len(slave.cti)
+        assert len(master.bte)   == len(slave.bte)
 
         # Same Clock Domain, direct connection.
         if cd_from == cd_to:
@@ -241,8 +243,8 @@ class ClockDomainCrossing(LiteXModule):
             ("dat_w", len(master.dat_w)),
             ("sel",   len(master.sel)),
             ("we",    1),
-            ("cti",   3),
-            ("bte",   2),
+            ("cti",   len(master.cti)),
+            ("bte",   len(master.bte)),
         ]
         response_layout = [
             ("dat_r", len(master.dat_r)),
@@ -254,28 +256,38 @@ class ClockDomainCrossing(LiteXModule):
         self.submodules += request_cdc, response_cdc
 
         # Master side.
+        master_active = Signal()
         master_fsm = ClockDomainsRenamer(cd_from)(FSM(reset_state="IDLE"))
         self.submodules.master_fsm = master_fsm
 
         self.comb += [
+            master_active.eq(master.cyc & master.stb),
             request_cdc.sink.adr.eq(master.adr),
             request_cdc.sink.dat_w.eq(master.dat_w),
             request_cdc.sink.sel.eq(master.sel),
             request_cdc.sink.we.eq(master.we),
             request_cdc.sink.cti.eq(master.cti),
             request_cdc.sink.bte.eq(master.bte),
-            master.dat_r.eq(response_cdc.source.dat_r),
-            master.ack.eq(response_cdc.source.valid & ~response_cdc.source.err),
-            master.err.eq(response_cdc.source.valid &  response_cdc.source.err),
         ]
 
         master_fsm.act("IDLE",
-            request_cdc.sink.valid.eq(master.cyc & master.stb),
+            request_cdc.sink.valid.eq(master_active),
             If(request_cdc.sink.valid & request_cdc.sink.ready,
                 NextState("WAIT-RESPONSE")
             )
         )
         master_fsm.act("WAIT-RESPONSE",
+            master.dat_r.eq(response_cdc.source.dat_r),
+            master.ack.eq(response_cdc.source.valid & master_active & ~response_cdc.source.err),
+            master.err.eq(response_cdc.source.valid & master_active &  response_cdc.source.err),
+            response_cdc.source.ready.eq(1),
+            If(response_cdc.source.valid,
+                NextState("IDLE")
+            ).Elif(~master_active,
+                NextState("DISCARD-RESPONSE")
+            )
+        )
+        master_fsm.act("DISCARD-RESPONSE",
             response_cdc.source.ready.eq(1),
             If(response_cdc.source.valid,
                 NextState("IDLE")
@@ -374,13 +386,20 @@ class InterconnectPointToPoint(LiteXModule):
 
 
 class Arbiter(LiteXModule):
-    def __init__(self, masters=None, target=None, controllers=None):
+    def __init__(self, masters=None, target=None, controllers=None, mode="cycle"):
         assert target is not None
         assert (masters is not None) or (controllers is not None)
         if controllers is not None:
             masters = controllers
 
-        self.rr = roundrobin.RoundRobin(len(masters))
+        if mode == "cycle":
+            self.rr = roundrobin.RoundRobin(len(masters))
+        elif mode == "transaction":
+            self.rr = roundrobin.RoundRobin(len(masters), roundrobin.SP_CE)
+            cycs = Array(m.cyc for m in masters)
+            self.comb += self.rr.ce.eq(target.ack | target.err | ~cycs[self.rr.grant])
+        else:
+            raise ValueError(f"Unsupported Wishbone Arbiter mode: {mode}.")
 
         # mux master->slave signals
         for name, size, direction in _layout:
@@ -446,18 +465,18 @@ class Decoder(LiteXModule):
 
 
 class InterconnectShared(LiteXModule):
-    def __init__(self, masters, slaves, register=False, timeout_cycles=1e6):
+    def __init__(self, masters, slaves, register=False, timeout_cycles=1e6, arbiter="cycle"):
         data_width, addressing = get_check_parameters(ports=masters + [s for _, s in slaves])
         adr_width = max([m.adr_width for m in masters])
         shared = Interface(data_width=data_width, adr_width=adr_width, addressing=addressing)
-        self.arbiter = Arbiter(masters, shared)
+        self.arbiter = Arbiter(masters, shared, mode=arbiter)
         self.decoder = Decoder(shared, slaves, register)
         if timeout_cycles is not None:
             self.timeout = Timeout(shared, timeout_cycles)
 
 
 class Crossbar(LiteXModule):
-    def __init__(self, masters, slaves, register=False, timeout_cycles=1e6):
+    def __init__(self, masters, slaves, register=False, timeout_cycles=1e6, arbiter="cycle"):
         data_width, addressing = get_check_parameters(ports=masters + [s for _, s in slaves])
         matches, busses = zip(*slaves)
         adr_width = max([m.adr_width for m in masters])
@@ -468,7 +487,7 @@ class Crossbar(LiteXModule):
             self.submodules += Decoder(master, row, register)
         # arbitrate each access column onto its slave
         for column, bus in zip(zip(*access), busses):
-            self.submodules += Arbiter(column, bus)
+            self.submodules += Arbiter(column, bus, mode=arbiter)
 
 # Wishbone Data Width Converter --------------------------------------------------------------------
 

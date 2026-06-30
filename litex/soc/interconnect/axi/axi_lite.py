@@ -139,19 +139,53 @@ class AXILiteInterface:
 # AXI-Lite Remapper --------------------------------------------------------------------------------
 
 class AXILiteRemapper(LiteXModule):
-    """Remaps AXI Lite addresses by applying an origin offset and address mask."""
-    def __init__(self, master, slave, origin=0, size=None):
-        # Mask.
+    """
+    AXI-Lite Remapper that supports sequential application of:
+    - An initial origin offset and address mask.
+    - Region-based remapping from specified source regions to destination regions.
+    """
+    def __init__(self, master, slave, origin=0, size=None, src_regions=None, dst_regions=None):
+        # Parameters.
+        # -----------
+        src_regions = src_regions or []
+        dst_regions = dst_regions or []
+        if len(src_regions) != len(dst_regions):
+            raise ValueError("AXI-Lite remapper source/destination region count mismatch.")
+
+        # Master to Slave.
+        # ----------------
+        self.comb += master.connect(slave)
+
+        # Origin Remapping.
+        # -----------------
+        # Compute Address Mask.
         if size is None:
             size = 2**master.address_width
         if size != 2**int(log2(size)):
             raise ValueError(f"Remapper size must be a power of 2 (got 0x{size:x}).")
         mask = 2**int(log2(size)) - 1
 
-        # Address Mask and Shift.
-        self.comb += master.connect(slave)
-        self.comb += slave.aw.addr.eq(origin | master.aw.addr & mask)
-        self.comb += slave.ar.addr.eq(origin | master.ar.addr & mask)
+        def remap_address(master_addr, slave_addr):
+            adr_remap = Signal(len(master_addr) + 1)
+            self.comb += [
+                adr_remap.eq(origin | (master_addr & mask)),
+                slave_addr.eq(adr_remap),
+            ]
+
+            # Regions Remapping.
+            # ------------------
+            for src_region, dst_region in zip(src_regions, dst_regions):
+                dst_adr = Signal(len(master_addr) + 1)
+                active  = Signal()
+                self.comb += [
+                    dst_adr.eq(dst_region.origin + adr_remap - src_region.origin),
+                    active.eq((adr_remap >= src_region.origin) & (adr_remap < (src_region.origin + src_region.size))),
+                    If(active, slave_addr.eq(dst_adr))
+                ]
+
+        # Apply Address Origin/Mask/Region Remapping.
+        remap_address(master.aw.addr, slave.aw.addr)
+        remap_address(master.ar.addr, slave.ar.addr)
 
 # AXI-Lite Offset ----------------------------------------------------------------------------------
 
@@ -342,6 +376,8 @@ class _AXILiteDownConverterWrite(LiteXModule):
         ratio        = dw_from//dw_to
 
         skip         = Signal()
+        aw_valid     = Signal()
+        w_valid      = Signal()
         counter      = Signal(max=ratio)
         aw_ready     = Signal()
         w_ready      = Signal()
@@ -354,6 +390,8 @@ class _AXILiteDownConverterWrite(LiteXModule):
             slave.aw.addr.eq(master.aw.addr + counter*(dw_to//8)),
             Case(counter, {i: slave.w.data.eq(master.w.data[i*dw_to:]) for i in range(ratio)}),
             Case(counter, {i: slave.w.strb.eq(master.w.strb[i*dw_to//8:]) for i in range(ratio)}),
+            aw_valid.eq(~skip & ~aw_ready),
+            w_valid.eq(~skip & ~w_ready),
             master.b.resp.eq(resp),
         ]
 
@@ -373,12 +411,12 @@ class _AXILiteDownConverterWrite(LiteXModule):
         )
         fsm.act("CONVERT",
             skip.eq(slave.w.strb == 0),
-            slave.aw.valid.eq(~skip & ~aw_ready),
-            slave.w.valid.eq(~skip & ~w_ready),
-            If(slave.aw.ready,
+            slave.aw.valid.eq(aw_valid),
+            slave.w.valid.eq(w_valid),
+            If(aw_valid & slave.aw.ready,
                 NextValue(aw_ready, 1)
             ),
-            If(slave.w.ready,
+            If(w_valid & slave.w.ready,
                 NextValue(w_ready, 1)
             ),
             # When skipping, we just increment the counter.
@@ -391,7 +429,7 @@ class _AXILiteDownConverterWrite(LiteXModule):
                     NextState("RESPOND-MASTER")
                 )
             # Write current word and wait for write response.
-            ).Elif((slave.aw.ready | aw_ready) & (slave.w.ready | w_ready),
+            ).Elif(((aw_valid & slave.aw.ready) | aw_ready) & ((w_valid & slave.w.ready) | w_ready),
                 NextState("RESPOND-SLAVE")
             )
         )
