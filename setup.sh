@@ -14,6 +14,7 @@ NC='\033[0m'
 # Default values (everything enabled by default)
 CONFIG="standard"
 SIMULATION_CPU="vexriscv"
+CPU_VARIANT="standard"
 HELP=0
 UPDATE=0
 SIMULATION_ONLY=0
@@ -33,7 +34,8 @@ Usage: ./setup.sh [OPTIONS]
 
 Options:
     --config=NAME       Install config: minimal, standard, full (default: standard)
-    --cpu=TYPE          CPU type for simulation: vexriscv, serv, lm32 (default: vexriscv)
+    --cpu=TYPE          CPU type: vexriscv, serv, cva6, ibex, rocket, vexriscv_smp (default: vexriscv)
+    --variant=TYPE      CPU variant for rocket: full, linux, medium, small (default: standard)
     --sim-only          Only run simulation (skip setup)
     --update            Force update repositories and reinstall
     --help, -h          Show this help message
@@ -42,6 +44,7 @@ Examples:
     ./setup.sh                          # Install everything and run simulation
     ./setup.sh --config=minimal         # Minimal installation
     ./setup.sh --cpu=serv               # Run simulation with SERV CPU
+    ./setup.sh --cpu=rocket --variant=full   # Run simulation with Rocket CPU (full variant)
     ./setup.sh --sim-only               # Only run simulation
     ./setup.sh --update                 # Force update and reinstall
 
@@ -59,6 +62,7 @@ parse_args() {
         case $1 in
             --config=*) CONFIG="${1#*=}"; shift ;;
             --cpu=*) SIMULATION_CPU="${1#*=}"; shift ;;
+            --variant=*) CPU_VARIANT="${1#*=}"; shift ;;
             --sim-only) SIMULATION_ONLY=1; shift ;;
             --update) UPDATE=1; shift ;;
             --help|-h) HELP=1; shift ;;
@@ -78,6 +82,38 @@ system_package_installed() {
         dpkg -l "$1" 2>/dev/null | grep -q "^ii"
     else
         return 1
+    fi
+}
+
+# Install SBT if not already installed
+install_sbt() {
+    if command_exists sbt; then
+        echo -e "${GREEN}✓ SBT already installed${NC}"
+        return 0
+    fi
+    
+    echo -e "${YELLOW}SBT not found. Installing...${NC}"
+    
+    # Remove broken repositories
+    sudo rm -f /etc/apt/sources.list.d/sbt.list /etc/apt/sources.list.d/sbt_old.list 2>/dev/null
+    
+    # Install Java if needed
+    if ! command_exists java; then
+        sudo apt-get install -y openjdk-17-jdk
+    fi
+    
+    # Download and install SBT
+    wget -qO /tmp/sbt-2.0.1.tgz https://github.com/sbt/sbt/releases/download/v2.0.1/sbt-2.0.1.tgz
+    sudo tar -xzf /tmp/sbt-2.0.1.tgz -C /usr/local/
+    sudo mv /usr/local/sbt-2.0.1 /usr/local/sbt 2>/dev/null || true
+    sudo ln -sf /usr/local/sbt/bin/sbt /usr/local/bin/sbt
+    rm -f /tmp/sbt-2.0.1.tgz
+    
+    if command_exists sbt; then
+        echo -e "${GREEN}✓ SBT installed successfully${NC}"
+    else
+        echo -e "${RED}✗ SBT installation failed${NC}"
+        exit 1
     fi
 }
 
@@ -138,8 +174,11 @@ install_system_deps() {
     if command_exists verilator; then
         echo -e "${GREEN}✓ verilator already installed${NC}"
     else
-        echo -e "${YELLOW}Installing verilator...${NC}"
-        sudo apt-get install -y verilator
+        echo -e "${YELLOW}Installing verilator from source (apt's version is too old)...${NC}"
+        sudo apt-get install -y git help2man perl python3 make autoconf g++ flex bison ccache libgoogle-perftools-dev numactl perl-doc libfl2 libfl-dev zlib1g zlib1g-dev
+        git clone --depth 1 --branch v5.034 https://github.com/verilator/verilator /tmp/verilator-build
+        (cd /tmp/verilator-build && autoconf && ./configure && make -j$(nproc) && sudo make install)
+        rm -rf /tmp/verilator-build
     fi
     
     # GTKWave (optional - for viewing waveforms)
@@ -223,8 +262,12 @@ run_litex_setup() {
 
 # Run simulation
 run_simulation() {
+    # Check if SBT is needed and install if missing
+    [[ "$SIMULATION_CPU" == "vexriscv_smp" ]] && install_sbt
+
     echo -e "\n${YELLOW}Running simulation...${NC}"
     echo -e "${BLUE}CPU: $SIMULATION_CPU${NC}"
+    echo -e "${BLUE}Variant: $CPU_VARIANT${NC}"
     echo -e "${YELLOW}Press Ctrl+C to exit${NC}"
     echo ""
     
@@ -239,13 +282,13 @@ run_simulation() {
     fi
     
     # Create timestamped project directory (DD-MMM_HH:MM)
-    PROJECT_DIR="../projects/$(date '+%d%b_%H_%M')"
+    PROJECT_DIR="../projects/$(date '+%d-%m-%H-%M')"
     mkdir -p "$PROJECT_DIR"
     
     echo -e "${BLUE}Project directory: $PROJECT_DIR${NC}"
     
     cd "$PROJECT_DIR"
-    litex_sim --cpu-type="$SIMULATION_CPU"
+    litex_sim --cpu-type="$SIMULATION_CPU" --cpu-variant="$CPU_VARIANT"
 }
 
 # Main function
