@@ -173,6 +173,138 @@ def test_generate_seu_emits_wait_interval_for_auto_mode():
     assert 'WAIT_INTERVAL", "42"' in cmds
 
 
+@pytest.mark.parametrize("partnumber, with_feedback_mode", [
+    ("T4F49",  False),
+    ("T8F81",  False),
+    ("T8Q144",  True),
+    ("T20F256", True),
+])
+def test_generate_pll_handles_trion_v1_feedback_mode(partnumber, with_feedback_mode):
+    writer = InterfaceWriter("/tmp/efinity")
+    block = {
+        "name"         : "pll0",
+        "input_freq"   : 33.333e6,
+        "input_clock"  : "CORE",
+        "input_signal" : "clk",
+        "resource"     : "PLL_0",
+        "locked"       : "locked",
+        "rstn"         : "rstn",
+        "clk_out"      : [["sys_clk", 33.333e6, 0, 0, False]],
+        "feedback"     : -1,
+        "version"      : "V1_V2",
+    }
+
+    cmds = writer.generate_pll(block, partnumber, verbose=False)
+    feedback_mode_cmd = 'design.set_property("pll0","FEEDBACK_MODE","INTERNAL","PLL")'
+
+    assert (feedback_mode_cmd in cmds) is with_feedback_mode
+    assert 'design.auto_calc_pll_clock("pll0", target_freq)' in cmds
+
+
+def test_generate_ddr_emits_controller_interfaces_and_swizzle():
+    def signal(name):
+        return migen.Signal(name_override=name)
+
+    axi_names = [
+        "araddr", "arapcmd", "arburst", "arid", "arlen", "arlock", "arqos", "arready",
+        "arsize", "resetn", "arvalid", "awaddr", "awallstrb", "awapcmd", "awburst",
+        "awcache", "awcobuf", "awid", "awlen", "awlock", "awqos", "awready", "awsize",
+        "awvalid", "bid", "bready", "bresp", "bvalid", "rdata", "rid", "rlast", "rready",
+        "rresp", "rvalid", "wdata", "wlast", "wready", "wstrb", "wvalid",
+    ]
+    writer = InterfaceWriter("/tmp/efinity")
+    writer.blocks.append({
+        "type"            : "DDR",
+        "name"            : "ddr_inst1",
+        "location"        : "DDR_0",
+        "memory_type"     : "LPDDR4x",
+        "memory_density"  : "8G",
+        "dq_width"        : 32,
+        "physical_rank"   : 1,
+        "clkin_sel"       : "CLKIN 0",
+        "axi"             : SimpleNamespace(**{name: signal(f"ddr0_{name}") for name in axi_names}),
+        "axi_clk"         : "sys_pll0_clk",
+        "axi_data_width"  : 512,
+        "cfg"             : SimpleNamespace(
+            done  = signal("cfg_done"),
+            reset = signal("cfg_reset"),
+            sel   = signal("cfg_sel"),
+            start = signal("cfg_start"),
+        ),
+        "pin_swizzle" : {
+            "CA"   : "CA[0],CA[1],CA[2],CA[3],CA[4],CA[5]",
+            "DQM0" : "DQ[3],DQ[6],DQ[4],DQ[5],DQ[0],DQ[1],DQ[7],DQ[2],DM[0]",
+        },
+    })
+
+    cmds = writer.generate(partnumber="Ti375C529")
+
+    assert 'design.create_block("ddr_inst1", "DDR")' in cmds
+    assert '"MEMORY_TYPE", "LPDDR4x", "DDR"' in cmds
+    assert '"AXI0_ARADDR_BUS", "ddr0_araddr", "DDR"' in cmds
+    assert '"AXI0_AWALLSTRB_PIN", "ddr0_awallstrb", "DDR"' in cmds
+    assert '"AXI0_CLK_INPUT_PIN", "sys_pll0_clk", "DDR"' in cmds
+    assert '"CFG_DONE_PIN", "cfg_done", "DDR"' in cmds
+    assert '"CTRL_BUSY_PIN", "", "DDR"' in cmds
+    assert '"PIN_SWIZZLE_DQM0", "DQ[3],DQ[6],DQ[4],DQ[5],DQ[0],DQ[1],DQ[7],DQ[2],DM[0]", "DDR"' in cmds
+    assert '"PIN_SWIZZLE_EN", "1", "DDR"' in cmds
+    assert 'design.assign_resource("ddr_inst1", "DDR_0", "DDR")' in cmds
+
+
+def test_add_trion_ddr_xml_emits_ports_and_configuration():
+    writer = InterfaceWriter("/tmp/efinity")
+    block = {
+        "type"              : "TRION_DDR",
+        "name"              : "ddr_inst1",
+        "location"          : "DDR_0",
+        "preset_id"         : 173,
+        "memory_type"       : "LPDDR3",
+        "controller_width"  : 32,
+        "dram_width"        : 32,
+        "memory_density"    : "8G",
+        "speedbin"          : 800,
+        "interface_name"    : "axi",
+        "port_count"        : 2,
+        "clock_name"        : "sys_pll0_clk",
+        "fpga_config"       : {"FPGA_ITERM": "120"},
+        "memory_config"     : {"CL": "RL=6/WL=3"},
+        "memory_timing"     : {"tRAS": 42.0},
+        "control_config"    : {"EN_AUTO_PWR_DN": "Off"},
+        "gate_delay_config" : {"GATE_C_DLY": 3},
+    }
+    namespace = "http://www.efinixinc.com/peri_design_db"
+    root = et.Element("root")
+    ddr_info = et.SubElement(root, "{{{}}}ddr_info".format(namespace))
+
+    writer.add_trion_ddr_xml(root, block)
+
+    ddr = list(ddr_info)[0]
+    assert ddr.attrib["cs_mem_type"] == "LPDDR3"
+    assert ddr.attrib["target1_enable"] == "true"
+    assert list(ddr)[0][0].attrib == {
+        "name"      : "axi0_wdata",
+        "type_name" : "WDATA_0",
+        "is_bus"    : "true",
+    }
+    assert list(ddr)[1][-1].attrib == {
+        "name"          : "sys_pll0_clk",
+        "type_name"     : "ACLK_1",
+        "is_bus"        : "false",
+        "is_clk"        : "true",
+        "is_clk_invert" : "false",
+    }
+    assert list(ddr)[5][0].attrib == {
+        "name"       : "tRAS",
+        "value"      : "42.000",
+        "value_type" : "float",
+    }
+    assert list(ddr)[7][0].attrib == {
+        "name"       : "GATE_C_DLY",
+        "value"      : "3",
+        "value_type" : "int",
+    }
+
+
 def test_find_efinity_path_prefers_env(monkeypatch, tmp_path):
     efinity_root = tmp_path / "efinity"
     bin_dir = efinity_root / "bin"

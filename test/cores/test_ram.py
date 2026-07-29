@@ -7,12 +7,19 @@
 import unittest
 from types import SimpleNamespace
 
-from migen import Array, If, Module, Signal, run_simulation
+from migen import Array, ClockDomain, If, Module, Signal, run_simulation
 from migen.fhdl.specials import Instance
 
 from litex.build.altera import AlteraPlatform
 from litex.build.efinix import EfinixPlatform
+from litex.build.generic_platform import GenericPlatform
 from litex.soc.cores.ram.common import RAM_CAPABILITIES, get_cpu_ram_filename
+from litex.soc.cores.ram.efinix_ddr import (
+    EfinixDDR,
+    EfinixTrionDDR,
+    add_efinix_ddr,
+    add_efinix_trion_ddr,
+)
 from litex.soc.cores.ram.efinix_hyperram import (
     EFINIX_HYPERRAM_DYN_PHASE_SEL_WIDTH,
     EFINIX_HYPERRAM_MAX_PHY_CLK_FREQ,
@@ -21,13 +28,15 @@ from litex.soc.cores.ram.efinix_hyperram import (
 from litex.soc.cores.ram.lattice_ice40 import Up5kSPRAM
 from litex.soc.cores.ram.lattice_nx import NXLRAM, initval_parameters
 from litex.soc.cores.ram.xilinx_fifo_sync_macro import FIFOSyncMacro
+from litex.soc.interconnect import axi
 
 kB = 1024
 
 
 class _FakeEfinixIfaceWriter:
     def __init__(self):
-        self.blocks = []
+        self.blocks     = []
+        self.xml_blocks = []
 
     def get_block(self, name):
         for block in self.blocks:
@@ -92,6 +101,68 @@ class _FakeEfinixHyperRAMPlatform:
         resource = "PLL{}".format(self.pll_used)
         self.pll_used += 1
         return resource
+
+
+class _FakeEfinixDDRPlatform(GenericPlatform):
+    family = "Trion"
+
+    def __init__(self):
+        GenericPlatform.__init__(self, device="test", io=[])
+        self.clks = {
+            "sys" : "sys_pll0_clk",
+            "cpu" : "cpu_pll0_clk",
+        }
+        self.toolchain = SimpleNamespace(
+            ifacewriter  = _FakeEfinixIfaceWriter(),
+            excluded_ios = [],
+        )
+
+    def add_iface_ios(self, ios):
+        self.add_extension(ios)
+        pads = self.request(ios[0][0])
+        self.toolchain.excluded_ios.extend(pads.flatten())
+        return pads
+
+
+class _FakeSoCBus:
+    address_width = 32
+
+    def __init__(self):
+        self.regions      = {}
+        self.slaves       = {}
+        self.strip_origin = {}
+
+    def add_region(self, name, region):
+        self.regions[name] = region
+
+    def add_slave(self, name, slave, region, strip_origin=False):
+        self.slaves[name]       = slave
+        self.regions[name]      = region
+        self.strip_origin[name] = strip_origin
+
+
+class _FakeNativeMemoryCPU(Module):
+    def __init__(self):
+        self.memory_buses = []
+
+    def add_memory_buses(self, address_width, data_width):
+        self.mBus_awallStrb = Signal()
+        self.memory_buses.append(axi.AXIInterface(
+            data_width    = data_width,
+            address_width = address_width,
+            id_width      = 8,
+            clock_domain  = "cpu",
+        ))
+
+
+class _FakeSoC(Module):
+    mem_map = {"main_ram": 0x4000_0000}
+
+    def __init__(self, cpu):
+        if isinstance(cpu, Module):
+            self.submodules.cpu = cpu
+        self.cpu = cpu
+        self.bus = _FakeSoCBus()
 
 
 class _IgnoreInstance:
@@ -446,6 +517,182 @@ class TestEfinixRAM(unittest.TestCase):
         self.assertIs(hyperram_blocks[0]["pads"], hyperram.io_pads)
         self.assertIn(platform.request("shift_ena"), platform.toolchain.excluded_ios)
         self.assertIn(hyperram.io_pads.csn, platform.toolchain.excluded_ios)
+
+    def test_efinix_ddr_registers_interface_block(self):
+        platform = _FakeEfinixDDRPlatform()
+
+        ddr = EfinixDDR(
+            platform       = platform,
+            memory_type    = "LPDDR4x",
+            memory_density = "8G",
+            clkin_sel      = "CLKIN 0",
+            pin_swizzle    = {"CA": "CA[0],CA[1],CA[2],CA[3],CA[4],CA[5]"},
+        )
+
+        block = platform.toolchain.ifacewriter.get_block("ddr_inst1")
+        self.assertEqual(block["type"], "DDR")
+        self.assertEqual(block["location"], "DDR_0")
+        self.assertEqual(block["axi_clk"], "sys_pll0_clk")
+        self.assertEqual(block["pin_swizzle"]["CA"], "CA[0],CA[1],CA[2],CA[3],CA[4],CA[5]")
+        self.assertEqual(ddr.bus.data_width, 512)
+        self.assertEqual(ddr.bus.address_width, 33)
+        self.assertEqual(ddr.bus.id_width, 8)
+        self.assertIn(ddr.axi_pads.awaddr, platform.toolchain.excluded_ios)
+        self.assertIn(ddr.cfg_pads.done, platform.toolchain.excluded_ios)
+
+    def test_efinix_ddr_preserves_configuration_start_delay(self):
+        platform = _FakeEfinixDDRPlatform()
+        ddr = EfinixDDR(
+            platform       = platform,
+            memory_type    = "LPDDR4x",
+            memory_density = "8G",
+            clkin_sel      = "CLKIN 0",
+            init_delay     = 4,
+        )
+
+        def generator():
+            for _ in range(4):
+                self.assertEqual((yield ddr.cfg_pads.reset), 1)
+                self.assertEqual((yield ddr.cfg_pads.start), 0)
+                yield
+            self.assertEqual((yield ddr.cfg_pads.reset), 0)
+            self.assertEqual((yield ddr.cfg_pads.start), 1)
+            yield ddr.cfg_pads.done.eq(1)
+            yield
+            self.assertEqual((yield ddr.init_done), 1)
+
+        dut = Module()
+        dut.clock_domains.cd_sys = ClockDomain()
+        dut.submodules.ddr = ddr
+        run_simulation(dut, generator())
+
+    def test_efinix_trion_ddr_registers_ports_and_xml(self):
+        platform = _FakeEfinixDDRPlatform()
+        ddr = EfinixTrionDDR(
+            platform         = platform,
+            preset_id        = 173,
+            memory_type      = "LPDDR3",
+            controller_width = 32,
+            dram_width       = 32,
+            memory_density   = "8G",
+            speedbin         = 800,
+            port_data_widths = (256, 128),
+            fpga_config      = {"FPGA_ITERM": "120"},
+            memory_timing    = {"tRAS": 42.0},
+        )
+
+        self.assertEqual([bus.data_width for bus in ddr.buses], [256, 128])
+        self.assertEqual(ddr.bus.address_width, 28)
+        self.assertEqual(len(platform.toolchain.ifacewriter.xml_blocks), 1)
+        self.assertIn(ddr.axi_pads[0].wdata, platform.toolchain.excluded_ios)
+
+        xml_block = platform.toolchain.ifacewriter.xml_blocks[0]
+        self.assertEqual(xml_block["type"], "TRION_DDR")
+        self.assertEqual(xml_block["clock_name"], "sys_pll0_clk")
+        self.assertEqual(xml_block["port_count"], 2)
+        self.assertEqual(xml_block["memory_timing"], {"tRAS": 42.0})
+
+    def test_efinix_trion_ddr_combines_axi_address_channels(self):
+        platform = _FakeEfinixDDRPlatform()
+        ddr = EfinixTrionDDR(
+            platform         = platform,
+            preset_id        = 173,
+            memory_type      = "LPDDR3",
+            controller_width = 32,
+            dram_width       = 32,
+            memory_density   = "8G",
+            speedbin         = 800,
+            port_data_widths = (256,),
+        )
+        bus  = ddr.bus
+        pads = ddr.axi_pads[0]
+
+        def generator():
+            yield bus.ar.addr.eq(0x1234)
+            yield bus.ar.valid.eq(1)
+            yield pads.aready.eq(1)
+            yield
+            self.assertEqual((yield pads.atype), 0)
+            self.assertEqual((yield pads.aaddr), 0x1234)
+            self.assertEqual((yield bus.ar.ready), 1)
+            self.assertEqual((yield bus.aw.ready), 0)
+
+            yield bus.ar.valid.eq(0)
+            yield bus.aw.addr.eq(0x5678)
+            yield bus.aw.valid.eq(1)
+            yield
+            self.assertEqual((yield pads.atype), 1)
+            self.assertEqual((yield pads.aaddr), 0x5678)
+            self.assertEqual((yield bus.aw.ready), 1)
+
+        dut = Module()
+        dut.clock_domains.cd_sys = ClockDomain()
+        dut.submodules.ddr = ddr
+        run_simulation(dut, generator())
+
+    def test_add_efinix_ddr_connects_native_cpu_sideband(self):
+        soc = _FakeSoC(_FakeNativeMemoryCPU())
+        ddr = SimpleNamespace(
+            bus = axi.AXIInterface(
+                data_width    = 512,
+                address_width = 33,
+                id_width      = 8,
+                clock_domain  = "cpu",
+            ),
+            awallstrb    = Signal(),
+            clock_domain = "cpu",
+        )
+
+        memory_bus = add_efinix_ddr(soc, ddr, size=0x4000_0000)
+
+        self.assertIs(memory_bus, soc.cpu.memory_buses[0])
+        self.assertEqual(memory_bus.address_width, 32)
+        self.assertEqual(soc.bus.regions["main_ram"].origin, 0x4000_0000)
+
+        def generator():
+            yield soc.cpu.mBus_awallStrb.eq(1)
+            yield
+            self.assertEqual((yield ddr.awallstrb), 1)
+
+        run_simulation(soc, generator())
+
+    def test_add_efinix_ddr_uses_soc_width_for_fallback_frontend(self):
+        cpu = SimpleNamespace(memory_buses=[])
+        soc = _FakeSoC(cpu)
+        ddr = SimpleNamespace(
+            bus = axi.AXIInterface(
+                data_width    = 512,
+                address_width = 33,
+                id_width      = 8,
+            ),
+            awallstrb    = Signal(),
+            clock_domain = "sys",
+        )
+
+        axi_lite_bus = add_efinix_ddr(soc, ddr, size=0x4000_0000)
+
+        self.assertEqual(axi_lite_bus.address_width, soc.bus.address_width)
+        self.assertIs(soc.bus.slaves["main_ram"], axi_lite_bus)
+
+    def test_add_efinix_trion_ddr_maps_each_target_port(self):
+        soc = _FakeSoC(SimpleNamespace(memory_buses=[]))
+        ddr = SimpleNamespace(
+            buses = [
+                axi.AXIInterface(data_width=256, address_width=28),
+                axi.AXIInterface(data_width=128, address_width=28),
+            ],
+            clock_domain = "sys",
+        )
+
+        frontends = add_efinix_trion_ddr(soc, ddr, size=0x1000_0000)
+
+        self.assertEqual(len(frontends), 2)
+        self.assertIs(soc.bus.slaves["main_ram"],  frontends[0])
+        self.assertIs(soc.bus.slaves["main_ram1"], frontends[1])
+        self.assertEqual(soc.bus.regions["main_ram"].origin,  0x4000_0000)
+        self.assertEqual(soc.bus.regions["main_ram1"].origin, 0x5000_0000)
+        self.assertTrue(soc.bus.regions["main_ram"].linker)
+        self.assertTrue(soc.bus.strip_origin["main_ram"])
 
 
 if __name__ == "__main__":
