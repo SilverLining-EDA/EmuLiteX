@@ -20,8 +20,11 @@ SERIAL_PORT="/dev/ttyUSB1"
 BAUDRATE="115200"
 FPGA_ONLY=0
 FLASH_ONLY=0
+FLAG_HELP=0
 HELP=0
 EXTRA_ARGS=""
+SCRIPT_DIR="$(pwd)"
+DEMO_MODE=0
 
 # Print banner
 print_banner() {
@@ -29,6 +32,11 @@ print_banner() {
     echo -e "${BLUE}  EmuLiteX - FPGA Setup Script${NC}"
     echo -e "${BLUE}========================================${NC}"
     echo ""
+}
+
+print_flag() {
+    setup_venv
+    python3 -m litex_boards.targets.digilent_arty --help      for board-specific options
 }
 
 # Print usage
@@ -45,9 +53,10 @@ Options:
     --baudrate=N        Baudrate (default: 115200)
     --fpga-only         Skip dependency checks, just build + flash + open terminal
     --flash-only        Skip build, flash existing bitstream for specified CPU + open terminal
+    --demo              Build and run demo application on FPGA (bare metal)
     --extra-args="..."  Extra arguments to pass to the build command (e.g., --sys-clk-freq=100e6)
     --help, -h          Show this help message
-
+    --flag               Show the flag for the for passing in extra_args 
 Examples:
     ./fpga_setup.sh                                    # Full flow: deps + build + flash + terminal
     ./fpga_setup.sh --extra-args="--sys-clk-freq=100e6"  # Build with 100MHz
@@ -72,7 +81,9 @@ parse_args() {
             --extra-args=*)   EXTRA_ARGS="${1#*=}";     shift ;;
             --fpga-only)      FPGA_ONLY=1;              shift ;;
             --flash-only)     FLASH_ONLY=1;             shift ;;
+            --demo) DEMO_MODE=1; shift ;;
             --help|-h)        HELP=1;                   shift ;;
+            --flag)         FLAG_HELP=1;              shift ;;
             --)               shift; EXTRA_ARGS="$*"; break ;;
             *)                echo -e "${RED}Unknown option: $1${NC}"; print_usage; exit 1 ;;
         esac
@@ -226,7 +237,7 @@ find_existing_bitstream() {
     fi
     
     # Look for bitstream with the specified CPU in fpga_projects, sorted by modification time (newest first)
-    BITSTREAM=$(find ../fpga_projects -type f -name "*.bit" -path "*${FPGA_CPU}*" 2>/dev/null | xargs ls -t 2>/dev/null | head -1)
+    BITSTREAM=$(find ../fpga_projects -type f -name "*.bit" -path "*/${BOARD}_${FPGA_CPU}_*" 2>/dev/null | xargs ls -t 2>/dev/null | head -1)
     
     if [ -n "$BITSTREAM" ] && [ -f "$BITSTREAM" ]; then
         echo "$BITSTREAM"
@@ -305,7 +316,7 @@ flash_bitstream() {
     # Find the most recent project dir containing a .bit for this CPU
     PROJECT_WITH_BIT=$(find ../fpga_projects -type f \
         -name "*.bit" \
-        -path "*${FPGA_CPU}*" \
+        -path "*/${BOARD}_${FPGA_CPU}_*" \
         2>/dev/null | xargs ls -t 2>/dev/null | head -1 | xargs -I{} dirname {} \
         | sed 's|/build/.*||')   # strip back to project root
 
@@ -322,11 +333,16 @@ flash_bitstream() {
     CMD="python3 -m litex_boards.targets.${BOARD} --load --cpu-type=$FPGA_CPU"
     [ -n "$BOARD_VARIANT" ] && CMD="$CMD --variant=$BOARD_VARIANT"
 
+    if [ -n "$EXTRA_ARGS" ]; then
+        CMD="$CMD $EXTRA_ARGS"
+    fi
+    
     echo -e "${BLUE}Running: $CMD${NC}"
     eval "$CMD"
 
     cd - > /dev/null
     echo -e "${GREEN}✓ FPGA loaded successfully${NC}"
+    echo -e "\n${GREEN}📁 Project Folder:${NC}\n${BLUE}$(cd "$PROJECT_WITH_BIT" && pwd)${NC}\n"
 }
 
 # Open serial terminal
@@ -352,18 +368,74 @@ open_terminal() {
         exit 1
     fi
     
-    picocom -b "$BAUDRATE" "$SERIAL_PORT"
+    # If demo mode and not IBEX, load demo using --kernel
+if [ "$DEMO_MODE" = "1" ] && [ "$FPGA_CPU" != "ibex" ]; then
+        PROJECT_WITH_BIT=$(find ../fpga_projects -type f -name "*.bit" -path "*/${BOARD}_${FPGA_CPU}_*" 2>/dev/null | xargs ls -t 2>/dev/null | head -1 | xargs -I{} dirname {} | sed 's|/build/.*||')
+
+        if [ -n "$PROJECT_WITH_BIT" ] && [ -f "${PROJECT_WITH_BIT}/demo/demo.bin" ]; then
+            echo -e "${YELLOW}Loading demo via litex_term --kernel...${NC}"
+            echo -e "${BLUE}Demo: ${PROJECT_WITH_BIT}/demo/demo.bin${NC}"
+            echo ""
+            litex_term "$SERIAL_PORT" --speed "$BAUDRATE" --kernel "${PROJECT_WITH_BIT}/demo/demo.bin"
+        else
+            echo -e "${RED}Demo binary not found!${NC}"
+            echo -e "${YELLOW}Please build demo first with: --demo${NC}"
+            exit 1
+        fi
+    else
+        # Normal terminal (no demo)
+        picocom -b "$BAUDRATE" "$SERIAL_PORT"
+    fi
+}
+
+build_demo_fpga() {
+    if [ "$FPGA_CPU" = "ibex" ]; then
+        echo -e "${YELLOW}⚠ IBEX: CSR/Zicsr not supported, skipping demo${NC}"
+        return 0
+    fi
+
+    DEMO_DIR="$(cd "$SCRIPT_DIR" && pwd)/litex/soc/software/demo"
+
+    PROJECT_WITH_BIT=$(find ../fpga_projects -type f \
+        -name "*.bit" \
+        -path "*/${BOARD}_${FPGA_CPU}_*" \
+        2>/dev/null | xargs ls -t 2>/dev/null | head -1 | xargs -I{} dirname {} \
+        | sed 's|/build/.*||')
+
+    if [ -z "$PROJECT_WITH_BIT" ] || [ ! -d "$PROJECT_WITH_BIT" ]; then
+        echo -e "${RED}No ${FPGA_CPU} bitstream/project found!${NC}"
+        return 1
+    fi
+    PROJECT_WITH_BIT="$(cd "$PROJECT_WITH_BIT" && pwd)"
+
+    BUILD_DIR="${PROJECT_WITH_BIT}/build/${BOARD}"
+    if [ ! -d "$BUILD_DIR" ]; then
+        echo -e "${RED}Build directory not found at: $BUILD_DIR${NC}"
+        return 1
+    fi
+
+    echo -e "${BLUE}Using build dir: $BUILD_DIR${NC}"
+
+    cd "$DEMO_DIR"
+    rm -rf demo/ demo.bin demo.fbi
+
+    python3 demo.py --build-path="$BUILD_DIR"
+
+    if [ -d "demo" ] && [ -f "demo/demo.bin" ]; then
+        cp -r demo/ "$PROJECT_WITH_BIT/"
+        echo -e "${GREEN}✓ Demo built and copied to: $PROJECT_WITH_BIT/demo/${NC}"
+    else
+        echo -e "${RED}Error: demo folder or demo.bin not found!${NC}"
+        return 1
+    fi
+
+    rm -rf demo/ demo.bin demo.fbi
+    cd - > /dev/null
 }
 
 # Main function
 main() {
     print_banner
-    parse_args "$@"
-    
-    if [ $HELP -eq 1 ]; then
-        print_usage
-        exit 0
-    fi
 
     # =============================================
     # Set default clock for CVA6 if not specified
@@ -374,6 +446,26 @@ main() {
     fi
     # =============================================
     
+    parse_args "$@"
+    
+    if [ $HELP -eq 1 ]; then
+        print_usage
+        exit 0
+    fi
+
+    if [ $FLAG_HELP -eq 1 ]; then
+        print_flag
+        exit 0
+    fi
+
+    # Check for IBEX + demo combination
+    if [ "$FPGA_CPU" = "ibex" ] && [ "$DEMO_MODE" = "1" ]; then
+        echo -e "${RED}⚠ IBEX CPU does not support CSR/Zicsr instructions required by demo. And give illegal instruction${NC}"
+        echo -e "${RED}⚠ Running FPGA build without demo...${NC}"
+        DEMO_MODE=0
+        echo ""
+    fi
+
     echo -e "${BLUE}Board: $BOARD${NC}"
     [ -n "$BOARD_VARIANT" ] && echo -e "${BLUE}Board variant: $BOARD_VARIANT${NC}"
     echo -e "${BLUE}CPU: $FPGA_CPU${NC}"
@@ -401,6 +493,12 @@ main() {
             source venv/bin/activate
         fi
         
+
+        # Build demo if --demo flag
+        if [ "$DEMO_MODE" = "1" ] && [ "$FPGA_CPU" != "ibex" ]; then
+            build_demo_fpga
+        fi
+
         flash_bitstream
         open_terminal
         exit 0
@@ -426,6 +524,12 @@ main() {
     setup_venv
     run_litex_setup
     build_bitstream
+
+    # Build demo if --demo flag
+    if [ "$DEMO_MODE" = "1" ] && [ "$FPGA_CPU" != "ibex" ]; then
+        build_demo_fpga
+    fi
+
     flash_bitstream
     open_terminal
 }
