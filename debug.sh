@@ -22,8 +22,14 @@ find_project() {
         return 0
     fi
     
-    # Find all digilent_arty_vexriscv_smp_* folders
-    local projects=$(find "$search_path" -maxdepth 1 -type d -name "digilent_arty_vexriscv_smp_*" 2>/dev/null | sort -r)
+    # Determine project pattern based on CPU type
+    local pattern="digilent_arty_vexriscv_smp_*"
+    if [ -n "$CPU_TYPE" ]; then
+        pattern="digilent_arty_${CPU_TYPE}*"
+    fi
+    
+    # Find all matching folders
+    local projects=$(find "$search_path" -maxdepth 1 -type d -name "$pattern" 2>/dev/null | sort -r)
     
     # If demo mode, find project with demo folder
     if [ "$DEMO_MODE" = "1" ]; then
@@ -47,6 +53,7 @@ find_project() {
 
 # Parse arguments
 DEMO_MODE=0
+CPU_TYPE=""
 PROJECT_PATH=""
 LITEX_TERM=0
 
@@ -60,12 +67,17 @@ while [[ $# -gt 0 ]]; do
             LITEX_TERM=1
             shift
             ;;
+        --cpu=*)
+            CPU_TYPE="${1#--cpu=}"
+            shift
+            ;;
         --help|-h)
             echo "Usage: ./debug.sh [OPTIONS] [path]"
             echo ""
             echo "Options:"
             echo "  --demo          Prefer projects with demo folder"
             echo "  litex_term      Open serial terminal (BIOS only)"
+            echo "  --cpu=CPU_TYPE  Specify CPU type"
             echo "  --help, -h      Show this help"
             echo ""
             echo "Examples:"
@@ -151,9 +163,15 @@ case $choice in
     1)
         echo ""
         echo -e "${YELLOW}Starting OpenOCD...${NC}"
-        echo -e "${BLUE}Command: openocd -d2 -f ../litex-boards/litex_boards/prog/openocd_xc7_ft2232.cfg -f litex/config/riscv_jtag_tunneled.cfg${NC}"
-        echo ""
-        openocd -d2 -f ../litex-boards/litex_boards/prog/openocd_xc7_ft2232.cfg -f litex/config/riscv_jtag_tunneled.cfg
+        if [ "$CPU_TYPE" = "veer_eh1" ]; then
+            echo -e "${BLUE}Command: openocd -d2 -f ../litex-boards/litex_boards/prog/openocd_xc7_ft2232.cfg -f litex/config/veer_eh1_arty_debug.cfg${NC}"
+            echo ""
+            openocd -d2 -f ../litex-boards/litex_boards/prog/openocd_xc7_ft2232.cfg -f litex/config/veer_eh1_arty_debug.cfg
+        else
+            echo -e "${BLUE}Command: openocd -d2 -f ../litex-boards/litex_boards/prog/openocd_xc7_ft2232.cfg -f litex/config/vexriscv_smp_jtag_tunneled.cfg${NC}"
+            echo ""
+            openocd -d2 -f ../litex-boards/litex_boards/prog/openocd_xc7_ft2232.cfg -f litex/config/vexriscv_smp_jtag_tunneled.cfg
+        fi
         ;;
     2)
         if [ ! -f "$PROJECT_PATH/demo/demo.elf" ]; then
@@ -209,6 +227,7 @@ case $choice in
             exit 1
         fi
         
+        source venv/bin/activate
         litex_term "$SERIAL_PORT" --speed "$BAUDRATE" --kernel "$PROJECT_PATH/demo/demo.bin"
         ;;
     5)
@@ -225,13 +244,8 @@ case $choice in
             ls /dev/ttyUSB* 2>/dev/null || echo "    No /dev/ttyUSB* found"
             exit 1
         fi
-        
-        if ! command -v picocom &> /dev/null; then
-            echo -e "${YELLOW}Installing picocom...${NC}"
-            sudo apt-get install -y picocom
-        fi
-        
-        picocom -b "$BAUDRATE" "$SERIAL_PORT"
+        source venv/bin/activate
+        litex_term "$SERIAL_PORT" --speed "$BAUDRATE" 
         ;;
     6)
         echo -e "${GREEN}Exiting...${NC}"
