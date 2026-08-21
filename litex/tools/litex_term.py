@@ -245,7 +245,7 @@ sfl_prompt_ack = b"\x06"
 sfl_magic_req = b"sL5DdSMmkekro\n"
 sfl_magic_ack = b"z6IHG7cYDID6o\n"
 
-sfl_payload_length  = 255
+sfl_payload_length  = 252
 sfl_address_length  = 4
 sfl_data_length     = sfl_payload_length - sfl_address_length
 sfl_safe_data_length = 64
