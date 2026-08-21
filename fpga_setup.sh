@@ -26,6 +26,10 @@ EXTRA_ARGS=""
 SCRIPT_DIR="$(pwd)"
 DEMO_MODE=0
 
+ICCM_ADR="0xee000000"  # Default ICCM address for VeeR EH1
+DEFAULT_ICCM_REGION="0xe"
+DEFAULT_ICCM_OFFSET="0x0e000000"
+
 # Print banner
 print_banner() {
     echo -e "${BLUE}========================================${NC}"
@@ -345,6 +349,36 @@ flash_bitstream() {
     echo -e "\n${GREEN}📁 Project Folder:${NC}\n${BLUE}$(cd "$PROJECT_WITH_BIT" && pwd)${NC}\n"
 }
 
+# Helper function to get ICCM address from extra_args or use default
+get_iccm_address() {
+    local iccm_region="$DEFAULT_ICCM_REGION"
+    local iccm_offset="$DEFAULT_ICCM_OFFSET"
+    local full_address=""
+    
+    if [[ "$EXTRA_ARGS" =~ --veer-iccm-address=([^\ ]+) ]]; then
+        full_address="${BASH_REMATCH[1]}"
+        echo "$full_address"
+        return
+    fi
+    
+    if [[ "$EXTRA_ARGS" =~ --veer-iccm-region=([^\ ]+) ]]; then
+        iccm_region="${BASH_REMATCH[1]}"
+    fi
+    
+    if [[ "$EXTRA_ARGS" =~ --veer-iccm-offset=([^\ ]+) ]]; then
+        iccm_offset="${BASH_REMATCH[1]}"
+    fi
+    
+    # Use bc for calculation to avoid bash syntax issues
+    region_dec=$((iccm_region))
+    offset_dec=$((iccm_offset))
+    
+    # Calculate using bc (no heredoc issues)
+    local calculated_addr=$(echo "$region_dec * 268435456 + $offset_dec" | bc)
+    
+    printf "0x%x" $calculated_addr
+}
+
 # Open serial terminal
 open_terminal() {
     echo -e "\n${YELLOW}Opening serial terminal...${NC}"
@@ -369,14 +403,30 @@ open_terminal() {
     fi
     
     # If demo mode and not IBEX, load demo using --kernel
-if [ "$DEMO_MODE" = "1" ] && [ "$FPGA_CPU" != "ibex" ]; then
+    if [ "$DEMO_MODE" = "1" ] && [ "$FPGA_CPU" != "ibex" ]; then
         PROJECT_WITH_BIT=$(find ../fpga_projects -type f -name "*.bit" -path "*/${BOARD}_${FPGA_CPU}_*" 2>/dev/null | xargs ls -t 2>/dev/null | head -1 | xargs -I{} dirname {} | sed 's|/build/.*||')
 
         if [ -n "$PROJECT_WITH_BIT" ] && [ -f "${PROJECT_WITH_BIT}/demo/demo.bin" ]; then
             echo -e "${YELLOW}Loading demo via litex_term --kernel...${NC}"
             echo -e "${BLUE}Demo: ${PROJECT_WITH_BIT}/demo/demo.bin${NC}"
             echo ""
-            litex_term "$SERIAL_PORT" --speed "$BAUDRATE" --kernel "${PROJECT_WITH_BIT}/demo/demo.bin"
+            
+            # Determine kernel address for VeeR EH1
+            if [ "$FPGA_CPU" = "veer_eh1" ]; then
+                # Check if ICCM is explicitly disabled
+                if [[ "$EXTRA_ARGS" =~ --veer-iccm-enable=0 ]]; then
+                    echo -e "${YELLOW}ICCM disabled, loading to default address${NC}"
+                    litex_term "$SERIAL_PORT" --speed "$BAUDRATE" --kernel "${PROJECT_WITH_BIT}/demo/demo.bin"
+                else
+                    # Get ICCM address (custom or default)
+                    ICCM_ADR=$(get_iccm_address)
+                    echo -e "${BLUE}Loading to ICCM at: $ICCM_ADR${NC}"
+                    litex_term "$SERIAL_PORT" --speed "$BAUDRATE" --kernel "${PROJECT_WITH_BIT}/demo/demo.bin" --kernel-adr "$ICCM_ADR"
+                    # litex_term "$SERIAL_PORT" --speed "$BAUDRATE" --kernel "${PROJECT_WITH_BIT}/demo/demo.bin" 
+                fi
+            else
+                litex_term "$SERIAL_PORT" --speed "$BAUDRATE" --kernel "${PROJECT_WITH_BIT}/demo/demo.bin"
+            fi
         else
             echo -e "${RED}Demo binary not found!${NC}"
             echo -e "${YELLOW}Please build demo first with: --demo${NC}"
@@ -384,7 +434,8 @@ if [ "$DEMO_MODE" = "1" ] && [ "$FPGA_CPU" != "ibex" ]; then
         fi
     else
         # Normal terminal (no demo)
-        picocom -b "$BAUDRATE" "$SERIAL_PORT"
+        litex_term "$SERIAL_PORT" --speed "$BAUDRATE"
+        # picocom -b "$BAUDRATE" "$SERIAL_PORT"
     fi
 }
 
@@ -419,7 +470,34 @@ build_demo_fpga() {
     cd "$DEMO_DIR"
     rm -rf demo/ demo.bin demo.fbi
 
-    python3 demo.py --build-path="$BUILD_DIR"
+    # Build demo with appropriate memory arguments
+    local DEMO_CMD="python3 demo.py --build-path=\"$BUILD_DIR\""
+    
+    if [ "$FPGA_CPU" = "veer_eh1" ]; then
+        # Check if ICCM is explicitly disabled
+        if [[ "$EXTRA_ARGS" =~ --veer-iccm-enable=0 ]]; then
+            echo -e "${RED}⚠ ICCM disabled - using default memory (main_ram + sram)${NC}"
+        else
+            # Get ICCM address (custom or default)
+            ICCM_ADR=$(get_iccm_address)
+            echo -e "${BLUE}Using ICCM address: $ICCM_ADR${NC}"
+            
+            # Check DCCM status
+            if [[ "$EXTRA_ARGS" =~ --veer-dccm-enable=0 ]]; then
+                echo -e "${YELLOW}⚠ VeeR EH1: ICCM only (DCCM disabled)${NC}"
+                DEMO_CMD="$DEMO_CMD --mem=iccm"
+            else
+                echo -e "${GREEN}✓ VeeR EH1: ICCM + DCCM${NC}"
+                DEMO_CMD="$DEMO_CMD"
+                DEMO_CMD="$DEMO_CMD --mem=iccm --runtime-mem=dccm"
+            fi
+        fi
+    else
+        echo -e "${GREEN}✓ Using default memory for $FPGA_CPU${NC}"
+    fi
+
+    echo -e "${BLUE}Running: $DEMO_CMD${NC}"
+    eval "$DEMO_CMD"
 
     if [ -d "demo" ] && [ -f "demo/demo.bin" ]; then
         cp -r demo/ "$PROJECT_WITH_BIT/"
