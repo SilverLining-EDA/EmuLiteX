@@ -164,19 +164,11 @@ class VeeREH1(CPU):
         VeeREH1.lsu_num_nbload    = args.veer_lsu_num_nbload
         VeeREH1.dec_instbuf_depth = args.veer_dec_instbuf_depth
 
-    # # GCC Flags.
-    # @property
-    # def gcc_flags(self):
-    #     flags = "-march=rv32imc -mabi=ilp32"
-    #     flags += " -D__veer_eh1__ "
-    #     return flags
     # GCC Flags.
     @property
     def gcc_flags(self):
         flags = "-march=rv32imc -mabi=ilp32"
         flags += " -D__veer_eh1__ "
-        override_header = os.path.join(os.path.dirname(__file__), "boot_override.h")
-        flags += f" -include {override_header} "
         return flags
 
     # Memory Mapping.

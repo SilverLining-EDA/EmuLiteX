@@ -80,8 +80,8 @@ enum {
 	ACK_OK
 };
 
-#ifndef BOOT_LOAD_MAX_SIZE_OVERRIDDEN
-#if defined(MAIN_RAM_BASE) || defined(MAIN_RAM_BASE_VA) || defined(SRAM_BASE) || defined(SRAM_BASE_VA)
+#if defined(MAIN_RAM_BASE) || defined(MAIN_RAM_BASE_VA) || defined(SRAM_BASE) || defined(SRAM_BASE_VA) \
+ || defined(ICCM_BASE) || defined(ICCM_BASE_VA) || defined(DCCM_BASE) || defined(DCCM_BASE_VA)
 static int boot_region_max_size(unsigned long addr, unsigned long base, unsigned long size, size_t *max_size)
 {
 	/* Compare offsets instead of region end so that regions ending exactly at
@@ -114,11 +114,26 @@ static int boot_load_max_size(unsigned long addr, size_t *max_size)
 	if (boot_region_max_size(addr, SRAM_BASE_VA, SRAM_SIZE, max_size))
 		return 1;
 #endif
+#ifdef ICCM_BASE
+	if (boot_region_max_size(addr, ICCM_BASE, ICCM_SIZE, max_size))
+		return 1;
+#endif
+#ifdef ICCM_BASE_VA
+	if (boot_region_max_size(addr, ICCM_BASE_VA, ICCM_SIZE, max_size))
+		return 1;
+#endif
+#ifdef DCCM_BASE
+	if (boot_region_max_size(addr, DCCM_BASE, DCCM_SIZE, max_size))
+		return 1;
+#endif
+#ifdef DCCM_BASE_VA
+	if (boot_region_max_size(addr, DCCM_BASE_VA, DCCM_SIZE, max_size))
+		return 1;
+#endif
 
 	printf("Error: boot load address 0x%08lx is outside writable memory\n", addr);
 	return 0;
 }
-#endif
 
 /*-----------------------------------------------------------------------*/
 /* ROM Boot                                                              */
