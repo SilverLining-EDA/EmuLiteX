@@ -3,7 +3,6 @@
 
 import os
 import subprocess
-from sys import platform
 
 from migen import *
 from litex.gen import *
@@ -33,7 +32,7 @@ class VeeREH1(CPU):
         0x8000_0000: 0x8000_0000,   # existing: CSR/PIC space
     } # Origin, Length.
 
-    bscan_tap   = 0     # Default     # Options: 0, 1 (1=Use BSCAN TAP for JTAG; 0=Use standard JTAG pins)
+    dmi_enable           = 0          # Default=0             # Options: 0=JTAG pins, 1=DMI register port
 
     # Enable/disable ------------------------------------------------------------------------------
     iccm_enable          = 1          # Default=0             # Options: 0, 1
@@ -80,8 +79,7 @@ class VeeREH1(CPU):
     @staticmethod
     def args_fill(parser):
         cpu_group = parser.add_argument_group(title="VeeR EH1 CPU options")
-        # BSCAN TAP for JTAG
-        cpu_group.add_argument("--veer-bscan-tap",      default=VeeREH1.bscan_tap,      help=f"Enable BSCAN TAP for JTAG. Default={VeeREH1.bscan_tap}", type=int)
+        cpu_group.add_argument("--veer-dmi-enable",     default=VeeREH1.dmi_enable,     help=f"Expose DMI register port (1) instead of JTAG pins (0). Default={VeeREH1.dmi_enable}", type=int)
         # Enable/disable options
         cpu_group.add_argument("--veer-iccm-enable",    default=VeeREH1.iccm_enable,    help=f"Enable ICCM (Instruction Tightly Coupled Memory). Default={VeeREH1.iccm_enable}", type=int)
         cpu_group.add_argument("--veer-dccm-enable",    default=VeeREH1.dccm_enable,    help=f"Enable DCCM (Data Tightly Coupled Memory). Default={VeeREH1.dccm_enable}", type=int)
@@ -123,8 +121,7 @@ class VeeREH1(CPU):
 
     @staticmethod
     def args_read(args):
-        # BSCAN TAP for JTAG
-        VeeREH1.bscan_tap         = args.veer_bscan_tap
+        VeeREH1.dmi_enable        = args.veer_dmi_enable
         # Enable/disable
         VeeREH1.iccm_enable       = args.veer_iccm_enable
         VeeREH1.dccm_enable       = args.veer_dccm_enable
@@ -194,7 +191,7 @@ class VeeREH1(CPU):
     def __init__(self, platform, variant="standard"):
         self.platform     = platform
         self.variant      = variant
-        self.bscan_tap = VeeREH1.bscan_tap
+        self.dmi_enable   = VeeREH1.dmi_enable
         self.reset        = Signal()
 
         n_ext_int = VeeREH1.pic_total_int   # RV_PIC_TOTAL_INT = Default 8
@@ -207,16 +204,13 @@ class VeeREH1(CPU):
         self.comb += self.extintsrc_req.eq(self.interrupt)
 
         # AXI Interfaces
-        self.ibus = axi.AXIInterface(data_width=64, address_width=32, id_width=3)  # RV_IFU_BUS_TAG = 3
-        self.dbus = axi.AXIInterface(data_width=64, address_width=32, id_width=4)  # RV_LSU_BUS_TAG = 4
-        self.sbus = axi.AXIInterface(data_width=64, address_width=32, id_width=1)  # RV_SB_BUS_TAG = 1
+        self.ibus    = axi.AXIInterface(data_width=64, address_width=32, id_width=3)  # RV_IFU_BUS_TAG = 3
+        self.dbus    = axi.AXIInterface(data_width=64, address_width=32, id_width=4)  # RV_LSU_BUS_TAG = 4
+        self.sbus    = axi.AXIInterface(data_width=64, address_width=32, id_width=1)  # RV_SB_BUS_TAG = 1
+        self.dma_axi = axi.AXIInterface(data_width=64, address_width=32, id_width=1)  # RV_DMA_BUS_TAG = 1
 
         self.periph_buses = [self.ibus, self.dbus, self.sbus]
         self.memory_buses = []
-
-        # Raw LSU master port and DMA slave port are exposed as AXI interfaces.
-        self.lsu_axi = axi.AXIInterface(data_width=64, address_width=32, id_width=4)
-        self.dma_axi = axi.AXIInterface(data_width=64, address_width=32, id_width=1)
 
         # CPU Instance parameters
         self.cpu_params = dict(
@@ -285,49 +279,49 @@ class VeeREH1(CPU):
             i_ifu_axi_rlast     = self.ibus.r.last,
 
             # LSU AXI4 Ports
-            o_lsu_axi_awvalid   = self.lsu_axi.aw.valid,
-            i_lsu_axi_awready   = self.lsu_axi.aw.ready,
-            o_lsu_axi_awid      = self.lsu_axi.aw.id,
-            o_lsu_axi_awaddr    = self.lsu_axi.aw.addr,
-            o_lsu_axi_awlen     = self.lsu_axi.aw.len,
-            o_lsu_axi_awsize    = self.lsu_axi.aw.size,
-            o_lsu_axi_awburst   = self.lsu_axi.aw.burst,
-            o_lsu_axi_awlock    = self.lsu_axi.aw.lock,
-            o_lsu_axi_awcache   = self.lsu_axi.aw.cache,
-            o_lsu_axi_awprot    = self.lsu_axi.aw.prot,
-            o_lsu_axi_awqos     = self.lsu_axi.aw.qos,
-            o_lsu_axi_awregion  = self.lsu_axi.aw.region,
+            o_lsu_axi_awvalid   = self.dbus.aw.valid,
+            i_lsu_axi_awready   = self.dbus.aw.ready,
+            o_lsu_axi_awid      = self.dbus.aw.id,
+            o_lsu_axi_awaddr    = self.dbus.aw.addr,
+            o_lsu_axi_awlen     = self.dbus.aw.len,
+            o_lsu_axi_awsize    = self.dbus.aw.size,
+            o_lsu_axi_awburst   = self.dbus.aw.burst,
+            o_lsu_axi_awlock    = self.dbus.aw.lock,
+            o_lsu_axi_awcache   = self.dbus.aw.cache,
+            o_lsu_axi_awprot    = self.dbus.aw.prot,
+            o_lsu_axi_awqos     = self.dbus.aw.qos,
+            o_lsu_axi_awregion  = self.dbus.aw.region,
 
-            o_lsu_axi_wvalid    = self.lsu_axi.w.valid,
-            i_lsu_axi_wready    = self.lsu_axi.w.ready,
-            o_lsu_axi_wdata     = self.lsu_axi.w.data,
-            o_lsu_axi_wstrb     = self.lsu_axi.w.strb,
-            o_lsu_axi_wlast     = self.lsu_axi.w.last,
+            o_lsu_axi_wvalid    = self.dbus.w.valid,
+            i_lsu_axi_wready    = self.dbus.w.ready,
+            o_lsu_axi_wdata     = self.dbus.w.data,
+            o_lsu_axi_wstrb     = self.dbus.w.strb,
+            o_lsu_axi_wlast     = self.dbus.w.last,
 
-            i_lsu_axi_bvalid    = self.lsu_axi.b.valid,
-            o_lsu_axi_bready    = self.lsu_axi.b.ready,
-            i_lsu_axi_bresp     = self.lsu_axi.b.resp,
-            i_lsu_axi_bid       = self.lsu_axi.b.id,
+            i_lsu_axi_bvalid    = self.dbus.b.valid,
+            o_lsu_axi_bready    = self.dbus.b.ready,
+            i_lsu_axi_bresp     = self.dbus.b.resp,
+            i_lsu_axi_bid       = self.dbus.b.id,
 
-            o_lsu_axi_arvalid   = self.lsu_axi.ar.valid,
-            i_lsu_axi_arready   = self.lsu_axi.ar.ready,
-            o_lsu_axi_arid      = self.lsu_axi.ar.id,
-            o_lsu_axi_araddr    = self.lsu_axi.ar.addr,
-            o_lsu_axi_arlen     = self.lsu_axi.ar.len,
-            o_lsu_axi_arsize    = self.lsu_axi.ar.size,
-            o_lsu_axi_arburst   = self.lsu_axi.ar.burst,
-            o_lsu_axi_arlock    = self.lsu_axi.ar.lock,
-            o_lsu_axi_arcache   = self.lsu_axi.ar.cache,
-            o_lsu_axi_arprot    = self.lsu_axi.ar.prot,
-            o_lsu_axi_arqos     = self.lsu_axi.ar.qos,
-            o_lsu_axi_arregion  = self.lsu_axi.ar.region,
+            o_lsu_axi_arvalid   = self.dbus.ar.valid,
+            i_lsu_axi_arready   = self.dbus.ar.ready,
+            o_lsu_axi_arid      = self.dbus.ar.id,
+            o_lsu_axi_araddr    = self.dbus.ar.addr,
+            o_lsu_axi_arlen     = self.dbus.ar.len,
+            o_lsu_axi_arsize    = self.dbus.ar.size,
+            o_lsu_axi_arburst   = self.dbus.ar.burst,
+            o_lsu_axi_arlock    = self.dbus.ar.lock,
+            o_lsu_axi_arcache   = self.dbus.ar.cache,
+            o_lsu_axi_arprot    = self.dbus.ar.prot,
+            o_lsu_axi_arqos     = self.dbus.ar.qos,
+            o_lsu_axi_arregion  = self.dbus.ar.region,
 
-            i_lsu_axi_rvalid    = self.lsu_axi.r.valid,
-            o_lsu_axi_rready    = self.lsu_axi.r.ready,
-            i_lsu_axi_rid       = self.lsu_axi.r.id,
-            i_lsu_axi_rdata     = self.lsu_axi.r.data,
-            i_lsu_axi_rresp     = self.lsu_axi.r.resp,
-            i_lsu_axi_rlast     = self.lsu_axi.r.last,
+            i_lsu_axi_rvalid    = self.dbus.r.valid,
+            o_lsu_axi_rready    = self.dbus.r.ready,
+            i_lsu_axi_rid       = self.dbus.r.id,
+            i_lsu_axi_rdata     = self.dbus.r.data,
+            i_lsu_axi_rresp     = self.dbus.r.resp,
+            i_lsu_axi_rlast     = self.dbus.r.last,
 
             # SB AXI4 Ports
             o_sb_axi_awvalid   = self.sbus.aw.valid,
@@ -377,36 +371,36 @@ class VeeREH1(CPU):
             # DMA AXI4 Ports (slave — CPU is target)
             i_dma_axi_awvalid   = self.dma_axi.aw.valid,
             o_dma_axi_awready   = self.dma_axi.aw.ready,
-            i_dma_axi_awid      = 0,
-            i_dma_axi_awaddr    = self.lsu_axi.aw.addr,
-            i_dma_axi_awsize    = self.lsu_axi.aw.size,
-            i_dma_axi_awlen     = 0,
-            i_dma_axi_awburst   = 0,
-            i_dma_axi_awprot    = 0,
+            i_dma_axi_awid      = self.dma_axi.aw.id,
+            i_dma_axi_awaddr    = self.dma_axi.aw.addr,
+            i_dma_axi_awsize    = self.dma_axi.aw.size,
+            i_dma_axi_awlen     = self.dma_axi.aw.len,
+            i_dma_axi_awburst   = self.dma_axi.aw.burst,
+            i_dma_axi_awprot    = self.dma_axi.aw.prot,
 
             i_dma_axi_wvalid    = self.dma_axi.w.valid,
             o_dma_axi_wready    = self.dma_axi.w.ready,
-            i_dma_axi_wdata     = self.lsu_axi.w.data,
-            i_dma_axi_wstrb     = self.lsu_axi.w.strb,
-            i_dma_axi_wlast     = 1,
+            i_dma_axi_wdata     = self.dma_axi.w.data,
+            i_dma_axi_wstrb     = self.dma_axi.w.strb,
+            i_dma_axi_wlast     = self.dma_axi.w.last,
 
             o_dma_axi_bvalid    = self.dma_axi.b.valid,
             i_dma_axi_bready    = self.dma_axi.b.ready,
             o_dma_axi_bresp     = self.dma_axi.b.resp,
-            o_dma_axi_bid       = Open(),
+            o_dma_axi_bid       = self.dma_axi.b.id,
 
             i_dma_axi_arvalid   = self.dma_axi.ar.valid,
             o_dma_axi_arready   = self.dma_axi.ar.ready,
-            i_dma_axi_arid      = 0,
-            i_dma_axi_araddr    = self.lsu_axi.ar.addr,
-            i_dma_axi_arsize    = self.lsu_axi.ar.size,
-            i_dma_axi_arprot    = 0,
-            i_dma_axi_arlen     = 0,
-            i_dma_axi_arburst   = 0,
+            i_dma_axi_arid      = self.dma_axi.ar.id,
+            i_dma_axi_araddr    = self.dma_axi.ar.addr,
+            i_dma_axi_arsize    = self.dma_axi.ar.size,
+            i_dma_axi_arlen     = self.dma_axi.ar.len,
+            i_dma_axi_arburst   = self.dma_axi.ar.burst,
+            i_dma_axi_arprot    = self.dma_axi.ar.prot,
 
             o_dma_axi_rvalid    = self.dma_axi.r.valid,
             i_dma_axi_rready    = self.dma_axi.r.ready,
-            o_dma_axi_rid       = Open(),
+            o_dma_axi_rid       = self.dma_axi.r.id,
             o_dma_axi_rdata     = self.dma_axi.r.data,
             o_dma_axi_rresp     = self.dma_axi.r.resp,
             o_dma_axi_rlast     = self.dma_axi.r.last,
@@ -444,146 +438,33 @@ class VeeREH1(CPU):
             o_trace_rv_i_tval_ip      = Open(),
         )
 
-        self.dma_bridge_params = dict(
-            p_M_ID_WIDTH  = 4,   # RV_LSU_BUS_TAG
-            p_S0_ID_WIDTH = 4,   # RV_LSU_BUS_TAG (external mem side reuses same tag width)
-            i_clk     = ClockSignal("sys"),
-            i_reset_l = ~ResetSignal("sys"),
-
-            # m_* = raw CPU LSU master port
-            i_m_arvalid = self.lsu_axi.ar.valid,
-            i_m_arid    = self.lsu_axi.ar.id,
-            i_m_araddr  = self.lsu_axi.ar.addr,
-            o_m_arready = self.lsu_axi.ar.ready,
-
-            o_m_rvalid  = self.lsu_axi.r.valid,
-            i_m_rready  = self.lsu_axi.r.ready,
-            o_m_rdata   = self.lsu_axi.r.data,
-            o_m_rid     = self.lsu_axi.r.id,
-            o_m_rresp   = self.lsu_axi.r.resp,
-            o_m_rlast   = self.lsu_axi.r.last,
-
-            i_m_awvalid = self.lsu_axi.aw.valid,
-            i_m_awid    = self.lsu_axi.aw.id,
-            i_m_awaddr  = self.lsu_axi.aw.addr,
-            o_m_awready = self.lsu_axi.aw.ready,
-
-            i_m_wvalid  = self.lsu_axi.w.valid,
-            o_m_wready  = self.lsu_axi.w.ready,
-
-            o_m_bresp   = self.lsu_axi.b.resp,
-            o_m_bvalid  = self.lsu_axi.b.valid,
-            o_m_bid     = self.lsu_axi.b.id,
-            i_m_bready  = self.lsu_axi.b.ready,
-
-            # s0_* = general/external memory = SoC-exposed bus
-            o_s0_arvalid = self.dbus.ar.valid,
-            i_s0_arready = self.dbus.ar.ready,
-
-            i_s0_rvalid  = self.dbus.r.valid,
-            i_s0_rid     = self.dbus.r.id,
-            i_s0_rresp   = self.dbus.r.resp,
-            i_s0_rdata   = self.dbus.r.data,
-            i_s0_rlast   = self.dbus.r.last,
-            o_s0_rready  = self.dbus.r.ready,
-
-            o_s0_awvalid = self.dbus.aw.valid,
-            i_s0_awready = self.dbus.aw.ready,
-
-            o_s0_wvalid  = self.dbus.w.valid,
-            i_s0_wready  = self.dbus.w.ready,
-            i_s0_bresp   = self.dbus.b.resp,
-            i_s0_bvalid  = self.dbus.b.valid,
-            i_s0_bid     = self.dbus.b.id,
-            o_s0_bready  = self.dbus.b.ready,
-
-            # s1_* = DMA slave port looping back into the CPU (ICCM writes)
-            o_s1_arvalid = self.dma_axi.ar.valid,
-            i_s1_arready = self.dma_axi.ar.ready,
-
-            i_s1_rvalid  = self.dma_axi.r.valid,
-            i_s1_rresp   = self.dma_axi.r.resp,
-            i_s1_rdata   = self.dma_axi.r.data,
-            i_s1_rlast   = self.dma_axi.r.last,
-            o_s1_rready  = self.dma_axi.r.ready,
-
-            o_s1_awvalid = self.dma_axi.aw.valid,
-            i_s1_awready = self.dma_axi.aw.ready,
-
-            o_s1_wvalid  = self.dma_axi.w.valid,
-            i_s1_wready  = self.dma_axi.w.ready,
-
-            i_s1_bresp   = self.dma_axi.b.resp,
-            i_s1_bvalid  = self.dma_axi.b.valid,
-            o_s1_bready  = self.dma_axi.b.ready,
-        )
-
-        self.comb += [
-            self.dbus.ar.addr.eq(self.lsu_axi.ar.addr),
-            self.dbus.ar.id.eq(self.lsu_axi.ar.id),
-            self.dbus.ar.len.eq(self.lsu_axi.ar.len),
-            self.dbus.ar.burst.eq(self.lsu_axi.ar.burst),
-            self.dbus.ar.size.eq(self.lsu_axi.ar.size),
-            self.dbus.aw.addr.eq(self.lsu_axi.aw.addr),
-            self.dbus.aw.id.eq(self.lsu_axi.aw.id),
-            self.dbus.aw.len.eq(self.lsu_axi.aw.len),
-            self.dbus.aw.burst.eq(self.lsu_axi.aw.burst),
-            self.dbus.aw.size.eq(self.lsu_axi.aw.size),
-            self.dbus.w.data.eq(self.lsu_axi.w.data),
-            self.dbus.w.strb.eq(self.lsu_axi.w.strb),
-        ]
-
-        self.comb += [
-            # s0 (general/external path → self.dbus): wlast is always 1 for LSU writes, so we can tie it high.
-            self.dbus.w.last.eq(1),     #or self.dbus.w.last.eq(self.lsu_axi.w.last),
-        ]
-        
-        if VeeREH1.bscan_tap == 1: 
-            # BSCAN TAP signals 
-            self.dmi_reg_en = Signal()
-            self.dmi_reg_addr = Signal(7)
-            self.dmi_reg_wr_en = Signal()
-            self.dmi_reg_wdata = Signal(32)
-            self.dmi_reg_rdata = Signal(32)
+        if self.dmi_enable:
+            self.dmi_reg_en     = Signal()
+            self.dmi_reg_addr   = Signal(7)
+            self.dmi_reg_wr_en  = Signal()
+            self.dmi_reg_wdata  = Signal(32)
+            self.dmi_reg_rdata  = Signal(32)
             self.dmi_hard_reset = Signal()
-            
             self.cpu_params.update(
-                i_dmi_reg_en=self.dmi_reg_en,
-                i_dmi_reg_addr=self.dmi_reg_addr,
-                i_dmi_reg_wr_en=self.dmi_reg_wr_en,
-                i_dmi_reg_wdata=self.dmi_reg_wdata,
-                o_dmi_reg_rdata=self.dmi_reg_rdata,
-                i_dmi_hard_reset=self.dmi_hard_reset,
-            )
-            # BSCAN TAP Instance parameters
-            self.bscan_params = dict(
-                i_clk = ClockSignal("sys"),
-                i_rst = ResetSignal("sys") | self.reset,  
-                i_jtag_id = 0,  
-                o_dmi_reg_wdata = self.dmi_reg_wdata,
-                o_dmi_reg_addr = self.dmi_reg_addr,
-                o_dmi_reg_wr_en = self.dmi_reg_wr_en,
-                o_dmi_reg_en = self.dmi_reg_en,
-                i_dmi_reg_rdata = self.dmi_reg_rdata,
-                o_dmi_hard_reset = self.dmi_hard_reset,
-                i_rd_status = 0,
-                i_idle = 0,
-                i_dmi_stat = 0,
-                i_version = 1,
+                i_dmi_reg_en     = self.dmi_reg_en,
+                i_dmi_reg_addr   = self.dmi_reg_addr,
+                i_dmi_reg_wr_en  = self.dmi_reg_wr_en,
+                i_dmi_reg_wdata  = self.dmi_reg_wdata,
+                o_dmi_reg_rdata  = self.dmi_reg_rdata,
+                i_dmi_hard_reset = self.dmi_hard_reset,
             )
         else:
-            # JTAG signals
             self.jtag_tck  = Signal()
             self.jtag_tms  = Signal()
             self.jtag_trst = Signal()
             self.jtag_tdi  = Signal()
             self.jtag_tdo  = Signal()
             self.cpu_params.update(
-                i_jtag_tck = self.jtag_tck,
-                i_jtag_tms = self.jtag_tms,
+                i_jtag_tck    = self.jtag_tck,
+                i_jtag_tms    = self.jtag_tms,
                 i_jtag_trst_n = self.jtag_trst,
-                i_jtag_tdi = self.jtag_tdi,
-                o_jtag_tdo = self.jtag_tdo,
+                i_jtag_tdi    = self.jtag_tdi,
+                o_jtag_tdo    = self.jtag_tdo,
             )
 
     def set_reset_address(self, reset_address):
@@ -610,14 +491,12 @@ class VeeREH1(CPU):
             cached = False,
             linker = True,
         ))
-        # ICCM: Route through DMA bus (dma_slave)
-        if VeeREH1.iccm_enable:            
-            # Add ICCM region  (for linker/memory map)
-            soc.bus.add_region("iccm", SoCRegion(
-                origin=soc.mem_map.get("iccm"),
-                size=VeeREH1.iccm_size * 1024,
-                cached=False,
-                linker=True,  
+        if VeeREH1.iccm_enable:
+            soc.bus.add_slave("iccm", self.dma_axi, region=SoCRegion(
+                origin = soc.mem_map.get("iccm"),
+                size   = VeeREH1.iccm_size * 1024,
+                cached = False,
+                linker = True,
             ))
         if VeeREH1.dccm_enable:
             # Add DCCM region  (for linker/memory map)
@@ -719,7 +598,7 @@ class VeeREH1(CPU):
         return snapshot_dir
 
     @staticmethod
-    def add_sources(platform, bscan_tap=False):
+    def add_sources(platform, dmi_enable=0):
         vdir = get_data_mod("cpu", "veer_eh1").data_location
 
         if getattr(platform, "output_dir", None) is not None:
@@ -760,28 +639,14 @@ class VeeREH1(CPU):
                     file_path = os.path.join(root, file)
                     platform.add_source(file_path)
 
-        verilog_dir = os.path.join(os.path.dirname(__file__), "verilog")
-        # Add axi_lsu_dma_bridge.sv explicitly
-        axi_lsu_dma_bridge = os.path.join(verilog_dir, "axi_lsu_dma_bridge.sv")
-        platform.add_source(axi_lsu_dma_bridge)
-
-        # Add BSCAN TAP files if enabled
-        if bscan_tap:
-            bscan_tap_file = os.path.join(verilog_dir, "bscan_tap.sv")
-            wrapper_file = os.path.join(verilog_dir, "veer_eh1_wrapper.sv")
-            platform.add_source(bscan_tap_file)
+        if dmi_enable:
+            wrapper_file = os.path.join(os.path.dirname(__file__), "veer_eh1_wrapper", "veer_eh1_dmi_wrapper.sv")
             platform.add_source(wrapper_file)
 
     def do_finalize(self):
         assert hasattr(self, "reset_address")
-        bscan_tap = getattr(self, "bscan_tap", False)
-        self.add_sources(self.platform, bscan_tap)  # Pass the parameter
-        
-        if self.bscan_tap:
-            # Use the VeeRwolf wrapper with BSCAN TAP
+        self.add_sources(self.platform, self.dmi_enable)
+        if self.dmi_enable:
             self.specials += Instance("veer_wrapper_dmi", **self.cpu_params)
-            self.specials += Instance("bscan_tap", **self.bscan_params)  
         else:
-            # Use the standard wrapper
             self.specials += Instance("veer_wrapper", **self.cpu_params)
-        self.specials += Instance("axi_lsu_dma_bridge", **self.dma_bridge_params)
