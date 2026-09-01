@@ -46,8 +46,9 @@ class RemoteClient(EtherboneIPC, CSRBuilder):
     def _receive_server_info(self):
         info = self.socket.recv(128).decode("utf-8", errors="ignore")
 
-        # With LitePCIe, CSRs are translated to 0 to limit BAR0 size, so also translate base address.
-        if "CommPCIe" in info and hasattr(self, "mems") and hasattr(self.mems, "csr"):
+        # BAR-window comms (LitePCIe / AWS F2 OCL) map CSR origin to offset 0.
+        if any(name in info for name in ("CommPCIe", "CommAWSF2")) and \
+                hasattr(self, "mems") and hasattr(self.mems, "csr"):
             self.base_address = -self.mems.csr.base
 
     def open(self):

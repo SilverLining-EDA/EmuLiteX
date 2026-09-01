@@ -222,17 +222,21 @@ def main():
     parser.add_argument("--devmem",          action="store_true",    help="Select DevMem interface (/dev/mem on a Hard CPU).")
     parser.add_argument("--devmem-base",     default="0xff200000",   help="Set DevMem window base address.")
     parser.add_argument("--devmem-size",     default="0x200000",     help="Set DevMem window size.")
+
+    # AWS F2 arguments (SDK peek/poke on AppPF BAR0 / OCL, same as HDK host examples)
+    parser.add_argument("--aws-f2",          action="store_true",    help="Select AWS F2 FPGA SDK interface (AppPF BAR0).")
+    parser.add_argument("--slot",            default=0, type=int,    help="AWS F2 FPGA slot number (with --aws-f2).")
     args = parser.parse_args()
 
     if args.udp_scan:
         args.udp = True
-    interfaces          = ["uart", "jtag", "udp", "pcie", "usb", "devmem"]
+    interfaces          = ["uart", "jtag", "udp", "pcie", "usb", "devmem", "aws_f2"]
     selected_interfaces = [name for name in interfaces if getattr(args, name)]
     if len(selected_interfaces) == 0:
-        parser.error("select one interface: --uart, --jtag, --udp, --udp-scan, --pcie, --usb or --devmem.")
+        parser.error("select one interface: --uart, --jtag, --udp, --udp-scan, --pcie, --usb, --devmem or --aws-f2.")
     if len(selected_interfaces) > 1:
         parser.error("select only one interface (got: {}).".format(
-            ", ".join("--" + name for name in selected_interfaces)))
+            ", ".join("--" + name.replace("_", "-") for name in selected_interfaces)))
 
     # UART mode
     if args.uart:
@@ -303,6 +307,12 @@ def main():
         devmem_size = int(args.devmem_size, base=0)
         print("[CommDevMem] base: 0x{:08x} / size: 0x{:08x} / ".format(devmem_base, devmem_size), end="")
         comm = CommDevMem(base=devmem_base, size=devmem_size, debug=args.debug)
+
+    # AWS F2 mode (fpga_pci_attach + peek/poke on AppPF BAR0)
+    elif args.aws_f2:
+        from litex.tools.remote.comm_aws_f2 import CommAWSF2
+        print("[CommAWSF2] slot: {} / AppPF BAR0 (OCL) / ".format(args.slot), end="")
+        comm = CommAWSF2(slot=args.slot, debug=args.debug)
 
     server = RemoteServer(comm, args.bind_ip, int(args.bind_port), addr_width=int(args.addr_width))
     server.open()
